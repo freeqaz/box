@@ -499,6 +499,35 @@ impl RunContract {
         if let Some(source) = policy_source {
             sources.push(source);
         }
+        let mut upstream_ca_pem = None;
+        if let Some(path) = self.file.upstream_ca_path(sources[0].path()) {
+            let (source, pem) = AuthoritySource::read(&path, "upstream CA")?;
+            if crate::record::layout::lies_within(source.path(), root.root()) {
+                return Err(ConfigError::Contract {
+                    reason: format!(
+                        "`upstream-ca-file` {} is inside `box_dir` {}",
+                        source.path().display(),
+                        root.root().display()
+                    ),
+                }
+                .into());
+            }
+            if !pem.contains("-----BEGIN CERTIFICATE-----") {
+                return Err(ConfigError::Contract {
+                    reason: format!(
+                        "`upstream-ca-file` {} holds no PEM certificate",
+                        source.path().display()
+                    ),
+                }
+                .into());
+            }
+            eprintln!(
+                "strands-box: the egress gateway also trusts the roots in {} for upstream servers",
+                source.path().display()
+            );
+            sources.push(source);
+            upstream_ca_pem = Some(pem);
+        }
         Ok(ConfigureRequest {
             record: Record {
                 version: record_version(
@@ -538,6 +567,7 @@ impl RunContract {
             policy,
             grammars: self.grammars,
             sources,
+            upstream_ca_pem,
         })
     }
 }
@@ -555,6 +585,9 @@ pub(crate) struct ConfigureRequest {
 
     /// The loaded source identities that the interpreters protect from mutation.
     pub(crate) sources: Vec<AuthoritySource>,
+
+    /// The PEM text of `upstream-ca-file`, which the gateway adds to its upstream trust.
+    pub(crate) upstream_ca_pem: Option<String>,
 }
 
 impl ConfigureRequest {
@@ -1391,6 +1424,12 @@ struct ConfigFile {
     #[serde(default)]
     policy: Option<PathBuf>,
 
+    /// Path to a PEM file of root certificates the egress gateway trusts for upstream servers, in
+    /// addition to its built-in public roots. Relative to the config file's directory unless
+    /// absolute.
+    #[serde(default, rename = "upstream-ca-file")]
+    upstream_ca_file: Option<PathBuf>,
+
     /// The agent this box runs.
     #[serde(default)]
     agent: Option<ProcessSpec>,
@@ -1442,6 +1481,20 @@ impl ConfigFile {
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
                 .join(policy),
+        )
+    }
+
+    /// The upstream CA path, resolved against the config file's directory.
+    fn upstream_ca_path(&self, config_path: &Path) -> Option<PathBuf> {
+        let path = self.upstream_ca_file.as_ref()?;
+        if path.is_absolute() {
+            return Some(path.clone());
+        }
+        Some(
+            config_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(path),
         )
     }
 
@@ -2487,6 +2540,7 @@ native-filesystem-policy = false
         for known in [
             format!("{required}[agent]\ncommand = [\"codex\"]"),
             format!("{required}policy = \"policy.dw\""),
+            format!("{required}upstream-ca-file = \"roots.pem\""),
             format!("{required}[tool.git]\ncommand = [\"git\"]"),
             format!(
                 "{required}[agent]\ncommand = [\"codex\"]\n[[agent.ingress]]\nlisten = \"0.0.0.0:8080\"\nworkload_port = 8081"
@@ -3797,6 +3851,14 @@ env = {}
     /// Write a box.toml whose body (the `[egress.*]`/`[mcp.*]` tables) is `body`, run it through
     /// `into_request`, and return the stored record or the configuration error.
     fn record_from_config(body: &str) -> Result<Record, crate::error::BoxError> {
+        request_from_config(body, &[]).map(|request| request.record)
+    }
+
+    /// As `record_from_config`, with `files` written beside `box.toml` first, and the whole request kept.
+    fn request_from_config(
+        body: &str,
+        files: &[(&str, &str)],
+    ) -> Result<ConfigureRequest, crate::error::BoxError> {
         let directory = tempfile::tempdir().expect("configuration directory");
         crate::test_support::with_operator_home(directory.path(), || {
             let workspace = directory.path().join("workspace");
@@ -3831,10 +3893,14 @@ env = {}
                 .expect("lock opens")
                 .expect("box is free");
             root.settle_identity(None).expect("identity settles");
+            for (name, text) in files {
+                let path = directory.path().join(name);
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("file directory");
+                std::fs::write(path, text).expect("write file");
+            }
             RunContract::read(&config_path, &workspace)
                 .expect("run contract loads")
                 .into_request(&root)
-                .map(|request| request.record)
         })
     }
 
@@ -4110,6 +4176,52 @@ command = ["mcp-server-fetch"]
                 expected: RECORD_VERSION
             })
         ));
+    }
+
+    const PEM: &str = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+
+    #[test]
+    fn an_upstream_ca_file_reaches_the_request_and_is_a_protected_source() {
+        let request =
+            request_from_config("upstream-ca-file = \"roots.pem\"\n", &[("roots.pem", PEM)])
+                .expect("a readable certificate file is accepted");
+        assert_eq!(request.upstream_ca_pem.as_deref(), Some(PEM));
+        assert_eq!(request.sources.len(), 3, "configuration, policy, and roots");
+    }
+
+    #[test]
+    fn no_upstream_ca_file_adds_no_trust() {
+        let request = request_from_config("", &[]).expect("accepted");
+        assert_eq!(request.upstream_ca_pem, None);
+    }
+
+    #[test]
+    fn an_upstream_ca_file_without_a_certificate_is_refused() {
+        let refusal = request_from_config(
+            "upstream-ca-file = \"roots.pem\"\n",
+            &[("roots.pem", "not a certificate\n")],
+        )
+        .err()
+        .expect("refused")
+        .to_string();
+        assert!(refusal.contains("holds no PEM certificate"), "{refusal}");
+    }
+
+    #[test]
+    fn an_upstream_ca_file_inside_the_box_directory_is_refused() {
+        let refusal = request_from_config(
+            "upstream-ca-file = \"box/roots.pem\"\n",
+            &[("box/roots.pem", PEM)],
+        )
+        .err()
+        .expect("refused")
+        .to_string();
+        assert!(refusal.contains("inside `box_dir`"), "{refusal}");
+    }
+
+    #[test]
+    fn a_missing_upstream_ca_file_is_refused() {
+        assert!(request_from_config("upstream-ca-file = \"absent.pem\"\n", &[]).is_err());
     }
 
     /// A name shared between `[egress.foo]` and `[mcp.foo] type = "http"` is not a collision: the two

@@ -33,6 +33,7 @@ struct LockedRun {
     policy: Option<Policy>,
     grammars: ToolGrammars,
     sources: Vec<AuthoritySource>,
+    upstream_ca_pems: Vec<String>,
     owned: Lock,
 }
 
@@ -257,6 +258,7 @@ async fn hosted(
         commands,
         collector,
         &locked.sources,
+        &locked.upstream_ca_pems,
         locked.owned,
         &locked.workspace,
         &home,
@@ -381,6 +383,7 @@ fn prepare(config: &Path, argv: &[OsString], box_id: Option<&str>) -> Result<Loc
         policy: request.policy,
         grammars: request.grammars,
         sources: request.sources,
+        upstream_ca_pems: request.upstream_ca_pem.into_iter().collect(),
         owned,
     })
 }
