@@ -515,15 +515,16 @@ impl RunContract {
                 }
                 .into());
             }
-            if !pem.contains("-----BEGIN CERTIFICATE-----") {
-                return Err(ConfigError::Contract {
+            // The gateway's own reading, so a file accepted here cannot fail the gateway's start
+            // after the workload is announced, and a refusal names the file.
+            egress_gateway::upstream_ca_certificates(&pem).map_err(|reason| {
+                ConfigError::Contract {
                     reason: format!(
-                        "`[gateway] upstream_ca_file` {} holds no PEM certificate",
+                        "`[gateway] upstream_ca_file` {} is refused: {reason}",
                         source.path().display()
                     ),
                 }
-                .into());
-            }
+            })?;
             eprintln!(
                 "strands-box: the egress gateway also trusts the roots in {} for upstream servers",
                 source.path().display()
@@ -4168,7 +4169,19 @@ command = ["mcp-server-fetch"]
         ));
     }
 
-    const PEM: &str = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+    /// A real CA certificate: the gateway refuses anything it cannot use as a trust anchor.
+    const PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBtjCCAVugAwIBAgIUQVaeNQHvFMoSYmbLGKAQph1hIDMwCgYIKoZIzj0EAwIw\n\
+JzElMCMGA1UEAwwcU3RyYW5kcyBCb3ggdGVzdCB1cHN0cmVhbSBDQTAgFw0yNjEx\n\
+MTYyMzQ4MDlaGA8yMTI2MTAyMzIzNDgwOVowJzElMCMGA1UEAwwcU3RyYW5kcyBC\n\
+b3ggdGVzdCB1cHN0cmVhbSBDQTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABFM5\n\
+zZttZSwGgijtclopiKnKYyT3t23OCdW81oXQs7meeR1pBoG9lW5ENeFjxtlSDct9\n\
+FklyoCSmGjjqYPscqumjYzBhMB0GA1UdDgQWBBRgqbTRveHuiNWFKKJBM8AYBO2I\n\
+JDAfBgNVHSMEGDAWgBRgqbTRveHuiNWFKKJBM8AYBO2IJDAPBgNVHRMBAf8EBTAD\n\
+AQH/MA4GA1UdDwEB/wQEAwIBBjAKBggqhkjOPQQDAgNJADBGAiEApD8FNLLRV3Z3\n\
+xvEQKiqvrbCfTGhjmNqHrCdDuwH8FW4CIQDMa23UzSKxvSOr5dR4L+xwJBJ1eGCm\n\
+TLkvUbcKVVrEFw==\n\
+-----END CERTIFICATE-----\n";
 
     /// A `[gateway]` that trusts `roots.pem` beside `box.toml`.
     const UPSTREAM_CA_ROOTS: &str = "[gateway]\nupstream_ca_file = \"roots.pem\"\n";
@@ -4234,6 +4247,31 @@ command = ["mcp-server-fetch"]
                 .expect("refused")
                 .to_string();
         assert!(refusal.contains("holds no PEM certificate"), "{refusal}");
+    }
+
+    /// Each file the gateway would refuse at start is refused at load, naming the file and why.
+    #[test]
+    fn an_upstream_ca_file_the_gateway_cannot_use_is_refused_at_load() {
+        let key =
+            "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIA==\n-----END PRIVATE KEY-----\n";
+        for (text, reason) in [
+            (
+                "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n".to_string(),
+                "not a usable trust anchor",
+            ),
+            (format!("{PEM}{key}"), "PrivateKey PEM block"),
+            (String::new(), "holds no PEM certificate"),
+        ] {
+            let refusal = request_from_config(UPSTREAM_CA_ROOTS, &[("roots.pem", text.as_str())])
+                .err()
+                .expect(reason)
+                .to_string();
+            assert!(refusal.contains(reason), "{reason}: {refusal}");
+            assert!(
+                refusal.contains("roots.pem"),
+                "the refusal names the file: {refusal}"
+            );
+        }
     }
 
     #[test]

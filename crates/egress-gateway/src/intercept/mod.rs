@@ -4,4 +4,6 @@
 pub(crate) mod mitm;
 
 #[cfg(feature = "tls-intercept")]
+pub use mitm::tls::upstream_ca_certificates;
+#[cfg(feature = "tls-intercept")]
 pub use mitm::{BackendDial, MitmConfig, MitmHandle, MitmInterceptor, ResponseLimits};
