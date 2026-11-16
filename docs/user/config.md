@@ -68,14 +68,13 @@ An unknown key at any level is a load error.
 
 ## Keys
 
-The file carries thirteen keys. `name` and `box_dir` are required.
+The file carries twelve keys. `name` and `box_dir` are required.
 
 | Key | Type | Meaning |
 |---|---|---|
 | `name` | string | Which box this is. One path component of letters, digits, `.`, `_`, or `-`, at most 32 bytes. |
 | `box_dir` | string | Where the box keeps its private state. Required, and absolute. |
 | `policy` | string | The Dogwood policy, relative to this file's directory unless absolute. Absent means no authored policy, and absent policy denies. |
-| `upstream-ca-file` | string | A PEM file of root certificates the egress gateway also trusts when it verifies a server, relative to this file's directory unless absolute. |
 | `[agent]` | table | The one process the box runs. |
 | `[tool.<name>]` | tables | One process each, which the agent selects by invocation. The label takes the same characters as `name`. |
 | `[egress.<name>]` | tables | Which secret attaches to which outbound destination. |
@@ -84,9 +83,9 @@ The file carries thirteen keys. `name` and `box_dir` are required.
 | `file-attributes` | boolean | Whether write folders on macOS may also set file times, and with them set-ID bits, the group, the owner, and access control lists. `false` by default. |
 | `[experimental-features]` | table | Optional experimental features: native filesystem policy checks, tool grammars, and ingress. Each is disabled by default. |
 | `[limits]` | table | Execution limits for Strands Shell. |
-| `[gateway]` | table | Settings for every request through the egress gateway: `upgrade_http`, the hosts whose plain `http://` on port 80 the gateway sends as `https://` on port 443. See [`[gateway]`](#gateway). |
+| `[gateway]` | table | Settings for every request through the egress gateway: `upgrade_http`, the hosts whose plain `http://` on port 80 the gateway sends as `https://` on port 443, and `upstream_ca_file`, extra CA certificates the gateway trusts for upstream servers. See [`[gateway]`](#gateway). |
 
-The example uses five of the thirteen: `name`, `box_dir`, `policy`, `[agent]`, and one
+The example uses five of the twelve: `name`, `box_dir`, `policy`, `[agent]`, and one
 `[egress.<name>]` table. It declares no tool, no MCP server, and no telemetry target.
 
 `name` and `box_dir` are the two required keys. `name` labels the box in its record and its
@@ -233,6 +232,7 @@ See [Shell timeouts](shell.md#limitsshelltimeout) for the call scope and
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `upgrade_http` | string array | empty | Host names whose plain `http://` request to port 80 the gateway decides and sends as `https://` on port 443. A host name alone: no scheme, port, path, `*` wildcard, or IP address. |
+| `upstream_ca_file` | string | absent | A PEM file of CA certificates the gateway also trusts when it verifies an upstream server, relative to this file's directory unless absolute. See [Trust a private CA for upstream servers](#trust-a-private-ca-for-upstream-servers). |
 
 ```toml
 [gateway]
@@ -244,6 +244,25 @@ upgraded request on port 443, as it decides HTTPS to that host, and a credential
 it. A box that sets the list stores its record at version 32, and an older build refuses it.
 [Upgrade plain HTTP to HTTPS](egress.md#upgrade-plain-http-to-https) describes the behaviour and
 its limits.
+
+### Trust a private CA for upstream servers
+
+On a network that re-signs TLS traffic, the gateway cannot verify the servers it reaches, because it
+trusts only a built-in set of public roots. The request passes policy, then the client gets an empty
+reply. Set `upstream_ca_file` to a PEM file that holds the roots your network signs with, and the
+gateway trusts those roots in addition to the built-in set.
+
+```toml
+[gateway]
+upstream_ca_file = "/path/to/corporate-roots.pem"
+```
+
+The file applies to every destination the gateway reaches, and to nothing else. It does not change
+the certificate the workload sees, and it does not change what policy permits. Only `box.toml`
+sets it: the agent and the tools cannot. `run` refuses a file that is missing, holds no
+certificate, or sits inside `box_dir`, and it refuses to start the workload if the file changes
+after it is read. A box that sets the file stores its record at version 36, and an older build
+refuses it.
 
 ## `[experimental-features]`
 
@@ -868,23 +887,6 @@ one `command[0]` names, such as `[tool.gh] command = ["gh"]` with `program = "gi
 
 An older build refuses a box that uses a grammar, so before you go back to one, turn
 `tool-grammars` off, remove every `grammar` table, and start the box once with this build.
-## `upstream-ca-file`
-
-On a network that re-signs TLS traffic, the gateway cannot verify the servers it reaches, because it
-trusts only a built-in set of public roots. The request passes policy, then the client gets an empty
-reply. Set `upstream-ca-file` to a PEM file that holds the roots your network signs with, and the
-gateway trusts those roots in addition to the built-in set.
-
-```toml
-upstream-ca-file = "/path/to/corporate-roots.pem"
-```
-
-The file applies to every destination the gateway reaches, and to nothing else. It does not change
-the certificate the workload sees, and it does not change what policy permits. Only `box.toml`
-sets it: the agent and the tools cannot. `run` refuses a file that is missing, holds no
-certificate, or sits inside `box_dir`, and it refuses to start the workload if the file changes
-after it is read.
-
 ## `[egress.<name>]`
 
 Each table binds one secret to a set of destinations, and its name is the operator's own label.

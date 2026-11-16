@@ -156,7 +156,7 @@ an originally nonempty query still removes the delimiter.
 
 After `http:request` permits the request, the gateway opens TLS to the server. It verifies the
 server's certificate against a compiled-in set of public root certificates plus the operator's
-`upstream-ca-file` ([why](./decisions.md#extra-upstream-roots-come-from-one-operator-file)), then
+`[gateway] upstream_ca_file` ([why](./decisions.md#extra-upstream-roots-come-from-one-operator-file)), then
 forwards the request. Each connection carries one request.
 
 A request the gateway refuses gets a 403 with the header `x-strands-box-egress: refused`, and a body

@@ -499,13 +499,16 @@ impl RunContract {
         if let Some(source) = policy_source {
             sources.push(source);
         }
+        // The record keeps the canonical path that was read, so a later run that names another
+        // file stores a changed record and says so.
+        let mut gateway = self.file.gateway.clone();
         let mut upstream_ca_pem = None;
-        if let Some(path) = self.file.upstream_ca_path(sources[0].path()) {
+        if let Some(path) = gateway.upstream_ca_path(sources[0].path()) {
             let (source, pem) = AuthoritySource::read(&path, "upstream CA")?;
             if crate::record::layout::lies_within(source.path(), root.root()) {
                 return Err(ConfigError::Contract {
                     reason: format!(
-                        "`upstream-ca-file` {} is inside `box_dir` {}",
+                        "`[gateway] upstream_ca_file` {} is inside `box_dir` {}",
                         source.path().display(),
                         root.root().display()
                     ),
@@ -515,7 +518,7 @@ impl RunContract {
             if !pem.contains("-----BEGIN CERTIFICATE-----") {
                 return Err(ConfigError::Contract {
                     reason: format!(
-                        "`upstream-ca-file` {} holds no PEM certificate",
+                        "`[gateway] upstream_ca_file` {} holds no PEM certificate",
                         source.path().display()
                     ),
                 }
@@ -525,6 +528,7 @@ impl RunContract {
                 "strands-box: the egress gateway also trusts the roots in {} for upstream servers",
                 source.path().display()
             );
+            gateway.upstream_ca_file = Some(source.path().to_path_buf());
             sources.push(source);
             upstream_ca_pem = Some(pem);
         }
@@ -546,11 +550,11 @@ impl RunContract {
                         .as_ref()
                         .is_some_and(|agent| !agent.ingress.is_empty()),
                     has_backend(&egress, &remote_mcp),
-                    &self.file.gateway,
+                    &gateway,
                 ),
                 experimental_features: self.file.experimental_features.clone(),
                 file_attributes: self.file.file_attributes,
-                gateway: self.file.gateway.clone(),
+                gateway,
                 limits: self.file.limits.clone(),
                 box_id: root.box_id().to_string(),
                 box_dir: root.root().to_path_buf(),
@@ -586,7 +590,7 @@ pub(crate) struct ConfigureRequest {
     /// The loaded source identities that the interpreters protect from mutation.
     pub(crate) sources: Vec<AuthoritySource>,
 
-    /// The PEM text of `upstream-ca-file`, which the gateway adds to its upstream trust.
+    /// The PEM text of `[gateway] upstream_ca_file`, which the gateway adds to its upstream trust.
     pub(crate) upstream_ca_pem: Option<String>,
 }
 
@@ -725,6 +729,9 @@ pub(crate) const SUPPLIED_IDENTITY_RECORD_VERSION: u32 = 34;
 /// The record version of a record whose process selects `file-watching`, so an older build
 /// refuses the box rather than resuming it with FSEvents refused.
 const FILE_WATCHING_RECORD_VERSION: u32 = 35;
+/// The record version of a record whose `[gateway]` trusts an operator's upstream CA file, so an
+/// older build refuses the box rather than resuming it with those upstreams failing verification.
+const UPSTREAM_CA_RECORD_VERSION: u32 = 36;
 
 /// Experimental mechanisms require explicit operator selection.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -779,13 +786,15 @@ fn record_version<'a>(
     has_backend: bool,
     gateway: &Gateway,
 ) -> u32 {
-    if specs.clone().any(|spec| spec.file_watching) {
+    if gateway.upstream_ca_file.is_some() {
+        UPSTREAM_CA_RECORD_VERSION
+    } else if specs.clone().any(|spec| spec.file_watching) {
         FILE_WATCHING_RECORD_VERSION
     } else if !generated_box_identity(box_id) {
         SUPPLIED_IDENTITY_RECORD_VERSION
     } else if limits.shell.has_stdin_limit() {
         SHELL_STDIN_LIMIT_RECORD_VERSION
-    } else if !gateway.is_default() {
+    } else if !gateway.upgrade_http.is_empty() {
         UPGRADE_HTTP_RECORD_VERSION
     } else if limits.shell.has_size_limits() {
         SHELL_SIZE_LIMITS_RECORD_VERSION
@@ -1074,6 +1083,7 @@ impl Record {
             SHELL_STDIN_LIMIT_RECORD_VERSION,
             SUPPLIED_IDENTITY_RECORD_VERSION,
             FILE_WATCHING_RECORD_VERSION,
+            UPSTREAM_CA_RECORD_VERSION,
         ]
         .contains(&stamped.version)
         {
@@ -1424,12 +1434,6 @@ struct ConfigFile {
     #[serde(default)]
     policy: Option<PathBuf>,
 
-    /// Path to a PEM file of root certificates the egress gateway trusts for upstream servers, in
-    /// addition to its built-in public roots. Relative to the config file's directory unless
-    /// absolute.
-    #[serde(default, rename = "upstream-ca-file")]
-    upstream_ca_file: Option<PathBuf>,
-
     /// The agent this box runs.
     #[serde(default)]
     agent: Option<ProcessSpec>,
@@ -1481,20 +1485,6 @@ impl ConfigFile {
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
                 .join(policy),
-        )
-    }
-
-    /// The upstream CA path, resolved against the config file's directory.
-    fn upstream_ca_path(&self, config_path: &Path) -> Option<PathBuf> {
-        let path = self.upstream_ca_file.as_ref()?;
-        if path.is_absolute() {
-            return Some(path.clone());
-        }
-        Some(
-            config_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(path),
         )
     }
 
@@ -2540,7 +2530,7 @@ native-filesystem-policy = false
         for known in [
             format!("{required}[agent]\ncommand = [\"codex\"]"),
             format!("{required}policy = \"policy.dw\""),
-            format!("{required}upstream-ca-file = \"roots.pem\""),
+            format!("{required}[gateway]\nupstream_ca_file = \"roots.pem\""),
             format!("{required}[tool.git]\ncommand = [\"git\"]"),
             format!(
                 "{required}[agent]\ncommand = [\"codex\"]\n[[agent.ingress]]\nlisten = \"0.0.0.0:8080\"\nworkload_port = 8081"
@@ -3071,7 +3061,7 @@ env = {}
     /// A foreign version refuses, and the refusal names BOTH versions.
     #[test]
     fn a_record_from_another_format_is_refused() {
-        for found in [RECORD_VERSION - 1, FILE_WATCHING_RECORD_VERSION + 1] {
+        for found in [RECORD_VERSION - 1, UPSTREAM_CA_RECORD_VERSION + 1] {
             let text = format!("version = {found}\n");
 
             let error = parsed_record(&text).expect_err("a foreign version must be refused");
@@ -4180,37 +4170,76 @@ command = ["mcp-server-fetch"]
 
     const PEM: &str = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
 
+    /// A `[gateway]` that trusts `roots.pem` beside `box.toml`.
+    const UPSTREAM_CA_ROOTS: &str = "[gateway]\nupstream_ca_file = \"roots.pem\"\n";
+
+    /// A stored upstream CA file cannot hide in a record an older build would read.
+    #[test]
+    fn an_upstream_ca_file_cannot_hide_in_a_legacy_record() {
+        let mut stored = record(None, BTreeMap::new());
+        stored.gateway.upstream_ca_file = Some(PathBuf::from("/etc/box/roots.pem"));
+        for found in [
+            RECORD_VERSION,
+            UPGRADE_HTTP_RECORD_VERSION,
+            FILE_WATCHING_RECORD_VERSION,
+        ] {
+            stored.version = found;
+            assert!(
+                matches!(
+                    Record::parse(&toml::to_string(&stored).unwrap(), Path::new("record.toml")),
+                    Err(ConfigError::RecordVersion {
+                        found: refused,
+                        expected: UPSTREAM_CA_RECORD_VERSION
+                    }) if refused == found
+                ),
+                "version {found}"
+            );
+        }
+    }
+
     #[test]
     fn an_upstream_ca_file_reaches_the_request_and_is_a_protected_source() {
-        let request =
-            request_from_config("upstream-ca-file = \"roots.pem\"\n", &[("roots.pem", PEM)])
-                .expect("a readable certificate file is accepted");
+        let request = request_from_config(UPSTREAM_CA_ROOTS, &[("roots.pem", PEM)])
+            .expect("a readable certificate file is accepted");
         assert_eq!(request.upstream_ca_pem.as_deref(), Some(PEM));
         assert_eq!(request.sources.len(), 3, "configuration, policy, and roots");
+        let stored = request
+            .record
+            .gateway
+            .upstream_ca_file
+            .as_deref()
+            .expect("the record keeps the file it trusts");
+        assert!(stored.is_absolute(), "{}", stored.display());
+        assert!(stored.ends_with("roots.pem"), "{}", stored.display());
+        assert_eq!(request.record.version, UPSTREAM_CA_RECORD_VERSION);
+        assert_eq!(
+            Record::parse(&request.record.to_toml().unwrap(), Path::new("record.toml")).unwrap(),
+            request.record
+        );
     }
 
     #[test]
     fn no_upstream_ca_file_adds_no_trust() {
         let request = request_from_config("", &[]).expect("accepted");
         assert_eq!(request.upstream_ca_pem, None);
+        assert_eq!(request.record.gateway.upstream_ca_file, None);
+        assert_ne!(request.record.version, UPSTREAM_CA_RECORD_VERSION);
     }
 
     #[test]
     fn an_upstream_ca_file_without_a_certificate_is_refused() {
-        let refusal = request_from_config(
-            "upstream-ca-file = \"roots.pem\"\n",
-            &[("roots.pem", "not a certificate\n")],
-        )
-        .err()
-        .expect("refused")
-        .to_string();
+        let refusal =
+            request_from_config(UPSTREAM_CA_ROOTS, &[("roots.pem", "not a certificate\n")])
+                .err()
+                .expect("refused")
+                .to_string();
         assert!(refusal.contains("holds no PEM certificate"), "{refusal}");
     }
 
     #[test]
     fn an_upstream_ca_file_inside_the_box_directory_is_refused() {
         let refusal = request_from_config(
-            "upstream-ca-file = \"box/roots.pem\"\n",
+            "[gateway]\nupstream_ca_file = \"box/roots.pem\"\n",
             &[("box/roots.pem", PEM)],
         )
         .err()
@@ -4221,7 +4250,9 @@ command = ["mcp-server-fetch"]
 
     #[test]
     fn a_missing_upstream_ca_file_is_refused() {
-        assert!(request_from_config("upstream-ca-file = \"absent.pem\"\n", &[]).is_err());
+        assert!(
+            request_from_config("[gateway]\nupstream_ca_file = \"absent.pem\"\n", &[]).is_err()
+        );
     }
 
     /// A name shared between `[egress.foo]` and `[mcp.foo] type = "http"` is not a collision: the two
