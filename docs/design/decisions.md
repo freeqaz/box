@@ -2315,7 +2315,12 @@ Honouring `SSL_CERT_FILE` in the trusted process lost, because Box composes its 
 does not inherit it. The roots are not the per-run CA the workload sees, and they add no allow
 authority, because the policy still decides what is reachable. The cost is that trust is
 gateway-wide: a root in the file can vouch for any host the policy permits, so the operator must
-vouch for every certificate in it. The reading of the file is pinned by
+vouch for every certificate in it. The gateway honours a root's name constraints, so a CA
+constrained to the operator's own domain narrows that cost without new matching on the TLS path
+(`a_name_constrained_root_vouches_only_for_its_names`). Box reads the file with the gateway's own
+parser before the workload starts, so a file the gateway would refuse is refused at load, naming
+the file. The other direct connections of the trusted process, telemetry export and
+`policy generate-schema`, keep the public roots only. The reading of the file is pinned by
 `an_upstream_ca_file_reaches_the_request_and_is_a_protected_source`, and the `box_dir` refusal by
 `an_upstream_ca_file_inside_the_box_directory_is_refused`.
 

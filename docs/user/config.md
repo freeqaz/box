@@ -247,22 +247,42 @@ its limits.
 
 ### Trust a private CA for upstream servers
 
-On a network that re-signs TLS traffic, the gateway cannot verify the servers it reaches, because it
-trusts only a built-in set of public roots. The request passes policy, then the client gets an empty
-reply. Set `upstream_ca_file` to a PEM file that holds the roots your network signs with, and the
-gateway trusts those roots in addition to the built-in set.
+The gateway verifies every upstream server against a built-in set of public roots. A server whose
+certificate a private CA signed fails that check: an internal service the box is meant to reach, or
+any host on a network that re-signs TLS traffic. The request passes policy, then the upstream
+handshake fails and the client gets no reply. Set `upstream_ca_file` to a PEM file that holds the CA
+certificates that sign those servers, and the gateway trusts them in addition to the built-in set.
 
 ```toml
 [gateway]
-upstream_ca_file = "/path/to/corporate-roots.pem"
+upstream_ca_file = "/etc/my-box/internal-ca.pem"
 ```
 
-The file applies to every destination the gateway reaches, and to nothing else. It does not change
-the certificate the workload sees, and it does not change what policy permits. Only `box.toml`
-sets it: the agent and the tools cannot. `run` refuses a file that is missing, holds no
-certificate, or sits inside `box_dir`, and it refuses to start the workload if the file changes
-after it is read. A box that sets the file stores its record at version 36, and an older build
-refuses it.
+- **Added, never substituted.** The public roots keep working beside the file's roots.
+- **Every upstream.** A root in the file vouches for any host the policy permits, so put in it only
+  CA certificates you would trust for every such host. A CA certificate with name constraints
+  vouches only for the names it permits, so a CA constrained to your internal domain cannot vouch
+  for a public host.
+- **Only the gateway.** The file changes which servers the gateway accepts, not what policy permits
+  and not the certificate the workload sees. Box's own direct connections do not use it: the
+  `[telemetry.<label>]` exporters and `strands-box policy generate-schema`, which lists a remote MCP
+  server's tools, still verify against the public roots only. Box reads neither `SSL_CERT_FILE` nor
+  the host's trust store.
+- **Only `box.toml`.** The agent and the tools cannot set it. `run` reads the file as an authority
+  source, as it reads the policy: it refuses a file that is missing, has more than one name, or sits
+  inside `box_dir`, and a file in which any PEM block is not a certificate, no certificate is
+  present, or a certificate cannot be used as a root. For each root, `run` prints its SHA-256
+  fingerprint and the file on stderr, in the spelling `openssl x509 -fingerprint -sha256` uses.
+- **Read once per run.** The gateway trusts the roots as `run` read them, and `run` refuses to start
+  the workload if the path names a different file by then. Edit the file between runs; each run
+  reads it again.
+- **The file's directory is protected.** For the run, the workload cannot change the file, and a
+  filesystem grant that encloses the file's directory loses that directory, as it does for the
+  policy's. Keep the file in a directory of its own, not in a shared directory such as
+  `/etc/ssl/certs`.
+
+A box that sets the file stores its absolute path in its record at version 36, and an older build
+refuses the box.
 
 ## `[experimental-features]`
 
