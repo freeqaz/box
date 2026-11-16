@@ -517,7 +517,7 @@ impl RunContract {
             }
             // The gateway's own reading, so a file accepted here cannot fail the gateway's start
             // after the workload is announced, and a refusal names the file.
-            egress_gateway::upstream_ca_certificates(&pem).map_err(|reason| {
+            let roots = egress_gateway::upstream_ca_certificates(&pem).map_err(|reason| {
                 ConfigError::Contract {
                     reason: format!(
                         "`[gateway] upstream_ca_file` {} is refused: {reason}",
@@ -525,10 +525,21 @@ impl RunContract {
                     ),
                 }
             })?;
-            eprintln!(
-                "strands-box: the egress gateway also trusts the roots in {} for upstream servers",
-                source.path().display()
-            );
+            // Each root by its SHA-256 fingerprint, as `openssl x509 -fingerprint -sha256` spells
+            // it, so a run's own output says which roots it trusted after the file changes.
+            for root in &roots {
+                use sha2::{Digest as _, Sha256};
+                let fingerprint: String = Sha256::digest(root)
+                    .iter()
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect::<Vec<_>>()
+                    .join(":");
+                eprintln!(
+                    "strands-box: the egress gateway also trusts the root sha256 {fingerprint} \
+                     from {} for upstream servers",
+                    source.path().display()
+                );
+            }
             gateway.upstream_ca_file = Some(source.path().to_path_buf());
             sources.push(source);
             upstream_ca_pem = Some(pem);
