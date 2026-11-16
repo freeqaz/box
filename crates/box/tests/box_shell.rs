@@ -1329,8 +1329,8 @@ when { context.input.path like "{workspace}*" };
 /// The clause gates **`net:connect`**, deliberately. The proxy answers a connect denial
 /// at CONNECT with `403` before any TLS (`tests/support/egress_probe.rs`), so the verdict
 /// is directly observable. Gating `http:request` instead would put the assertion behind a
-/// handshake the box refuses anyway — it will not trust a fixture CA — and the test could
-/// not tell a policy denial from that refusal.
+/// handshake the box refuses anyway — it names no CA file, so it trusts no fixture CA — and
+/// the test could not tell a policy denial from that refusal.
 fn no_egress_after_secret_read(host: &str, port: u16) -> String {
     format!(
         r#"

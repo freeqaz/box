@@ -481,10 +481,11 @@ fn an_unknown_config_field_is_refused_at_configure() {
 ///
 /// The wire-level swap (phantom out, `Real_Secret` upstream) is proven at the proxy layer
 /// in `egress-proxy`'s `interception_e2e.rs::opaque_swap_reaches_upstream_with_real_secret`,
-/// which can supply `upstream_ca_pems` for a fixture upstream. `strands-box` deliberately
-/// does **not** expose that knob — an operator cannot make the box trust an arbitrary
-/// upstream CA — so this layer asserts what only it can: the config-declared destination
-/// is admitted, the request is governed end to end, and the secret never enters the box.
+/// which can supply `upstream_ca_pems` for a fixture upstream, and through `run` in
+/// `box_upstream_ca.rs`, where the operator names the fixture's CA in
+/// `[gateway] upstream_ca_file`. This box names no CA file, so this layer asserts what it
+/// can without one: the config-declared destination is admitted, the request is governed
+/// end to end, and the secret never enters the box.
 #[test]
 fn a_configured_destination_is_admitted_through_the_boundary() {
     if !fixture::namespace_launcher_is_usable() {
@@ -513,8 +514,8 @@ fn a_configured_destination_is_admitted_through_the_boundary() {
         !out.contains("status=403"),
         "the configured destination must be admitted: stdout={out:?} stderr={stderr:?}"
     );
-    // The upstream leg fails closed because the box will not trust a fixture CA, which is
-    // itself the property worth pinning: there is no operator knob to weaken it.
+    // The upstream leg fails closed because this box names no CA file, so only the public
+    // roots vouch for an upstream and none of them signed the fixture's certificate.
     assert!(
         !stderr.contains("HTTPS_PROXY is not set"),
         "the daemon's proxy must be seeded into the workload: {stderr:?}"
