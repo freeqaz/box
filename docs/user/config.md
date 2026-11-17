@@ -232,6 +232,7 @@ See [Shell timeouts](shell.md#limitsshelltimeout) for the call scope and
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `upgrade_http` | string array | empty | Host names whose plain `http://` request to port 80 the gateway decides and sends as `https://` on port 443. A host name alone: no scheme, port, path, `*` wildcard, or IP address. |
+| `credential_source.<name>` | table | none | An endpoint that gives the credential for each request on a `source://<name>` route, after policy permits the request. Keys: `endpoint`, `ca_file`, `bearer`, `timeout_ms`, `max_body_bytes`. See [Request-time sources](egress.md#request-time-sources). |
 
 ```toml
 [gateway]
@@ -243,6 +244,18 @@ upgraded request on port 443, as it decides HTTPS to that host, and a credential
 it. A box that sets the list stores its record at version 32, and an older build refuses it.
 [Upgrade plain HTTP to HTTPS](egress.md#upgrade-plain-http-to-https) describes the behaviour and
 its limits.
+
+```toml
+[gateway.credential_source.github]
+endpoint = "unix:///run/credential-source/source.sock"
+bearer   = "env://SOURCE_TOKEN"
+```
+
+A credential source adds no grant. Policy decides each request before the gateway asks the source,
+and the source can only give a value for the route's own placement or refuse. The record keeps the
+socket path and the `ca_file` path canonical, and the box reads `ca_file` as an authority source,
+so the workload can't change it. A `ca_file` or a socket inside `box_dir` is refused. A box that
+declares a source stores its record at version 36, and an older build refuses it.
 
 ## `[experimental-features]`
 
@@ -884,13 +897,14 @@ requests out. The current reference for this table is
 |---|---|---|
 | `destinations` | string array | A host, `host:port`, a path prefix or `/*` suffix, or a `*.` wildcard. A pattern that matches every host is refused, and two entries may not overlap. |
 | `protocol` | string | `http`, the default and the only accepted value. |
-| `secret.ref` | string | `env://NAME` for a variable on the operator's side, `aws://PROFILE` to SigV4-sign as a named profile (resolved through the AWS SDK), or a bare `aws://` to sign with the AWS SDK default credential provider chain (the host's ambient identity). Required. A literal value, or any other scheme, is refused. |
+| `secret.ref` | string | `env://NAME` for a variable on the operator's side, `aws://PROFILE` to SigV4-sign as a named profile (resolved through the AWS SDK), a bare `aws://` to sign with the AWS SDK default credential provider chain (the host's ambient identity), or `source://NAME` for the `[gateway.credential_source.NAME]` that gives the credential for each request. Required. A literal value, or any other scheme, is refused. |
+| `secret.env` | string | The variable the placeholder goes in. Required by, and only valid for, a `source://` route. |
 | `secret.placement` | string | `header` (default), `basic_auth`, or `query_param`. |
 | `secret.header` | string | The header the secret lands in. Defaults to `Authorization`. |
 | `secret.prefix` | string | Text before the secret in the header value. Defaults to `Bearer ` on `Authorization`, and empty elsewhere. |
 | `secret.param` | string | The query-parameter name. Required by, and only valid for, `placement = "query_param"`. |
-| `secret.inject` | string | `phantom` (default) or `always`. `phantom` attaches the real secret only to a request that presents the box's placeholder, and rejects any other. `always` attaches the real secret to every request to the destinations, with or without a placeholder, and the decision record carries an advisory note. Valid only for an `env://` route. |
-| `secret.phantom_prefix` | string | The literal prefix of the minted placeholder, before its random suffix. Defaults to `strands_box_`. Set it, such as `sk-ant-`, so a harness that checks its key format accepts the placeholder. At most 64 characters from `A-Z`, `a-z`, `0-9`, `-`, `_`, `.`, `~`. Valid only for an `env://` route. |
+| `secret.inject` | string | `phantom` (default) or `always`. `phantom` attaches the real secret only to a request that presents the box's placeholder, and rejects any other. `always` attaches the real secret to every request to the destinations, with or without a placeholder, and the decision record carries an advisory note. Valid only for an `env://` or `source://` route. |
+| `secret.phantom_prefix` | string | The literal prefix of the minted placeholder, before its random suffix. Defaults to `strands_box_`. Set it, such as `sk-ant-`, so a harness that checks its key format accepts the placeholder. At most 64 characters from `A-Z`, `a-z`, `0-9`, `-`, `_`, `.`, `~`. Valid only for an `env://` or `source://` route. |
 
 The example takes every default: the key lands in the `Authorization` header with a `Bearer `
 prefix, and only a request that carries the placeholder gets it.

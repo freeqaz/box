@@ -262,7 +262,9 @@ Each looks like a simplification and is not. If one is genuinely wanted, record 
   checks and tool grammars. They add no authority beyond the authored policy. `file-attributes` adds
   no grant: it widens what the workload's own `write` lists allow on macOS, so it is part of the
   workload input, and each process discloses it. `[gateway] upgrade_http` adds no grant either:
-  policy decides each upgraded request on port 443, as it decides a `CONNECT` to that host. `[agent]` and each
+  policy decides each upgraded request on port 443, as it decides a `CONNECT` to that host.
+  `[gateway.credential_source.<name>]` adds no grant: the gateway asks it for a request's credential
+  only after policy permits the request, and it can only give a value or refuse. `[agent]` and each
   `[tool.<label>]` hold one `ProcessSpec`, which is six fields — `command`, `workspace`, `env`,
   `filesystem`, `native-filesystem-policy`, and `grammar`. Only a `[tool.<label>]` takes
   `grammar`, behind `[experimental-features] tool-grammars`, and `[agent]` refuses it. `filesystem` holds the path lists: eight for `[agent]`, six

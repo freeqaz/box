@@ -141,6 +141,11 @@ path = "tests/box_credentials.rs"
 required-features = ["test-support"]
 
 [[test]]
+name = "box_credential_source"
+path = "tests/box_credential_source.rs"
+required-features = ["test-support"]
+
+[[test]]
 name = "box_shell"
 path = "tests/box_shell.rs"
 required-features = ["test-support"]

@@ -108,6 +108,10 @@ the egress gateway decides and sends as `https://` on port 443. Policy still dec
 request, on port 443, so the key grants no reach a permit does not. An entry with a scheme, a port, a
 path, a wildcard, or an IP address is a load error. See
 [upgrade plain HTTP to HTTPS](../../docs/user/egress.md#upgrade-plain-http-to-https).
+`[gateway.credential_source.<name>]` declares an endpoint (`unix:///path` or `https://host`) that
+gives the credential of each request on a `source://<name>` route, after policy permits the
+request. The source gives a value for the route's own placement or refuses, so it grants no reach a
+permit does not. See [request-time sources](../../docs/user/egress.md#request-time-sources).
 
 **`[agent]` and each `[tool.<label>]` hold the same four fields.** `[agent]` is the process the
 operator starts. A `[tool.<label>]` is a process the Shell runs for a request the policy already
@@ -331,15 +335,16 @@ secret.ref   = "aws://prod"
 |---|---|---|
 | `destinations` | required | One or more destinations this secret is attached at. Each is an exact host, a `*.` suffix wildcard, an explicit `:port`, and a path prefix or `/*suffix`. Not a regex. |
 | `protocol` | `http` | What the destination speaks. `mcp` makes the gateway parse JSON-RPC frames and raise `mcp:call`; `http` is an ordinary request. |
-| `secret.ref` | required unless a backend is declared | `env://NAME`, `aws://profile` (static keys), or a bare `aws://` (the AWS default credential chain). No other scheme. See below. Beside a backend it must be `env://`, and it is phantom-only: the box provisions the placeholder and strips it, and never injects the real destination credential (the backend handles the destination's auth). |
+| `secret.ref` | required unless a backend is declared | `env://NAME`, `aws://profile` (static keys), a bare `aws://` (the AWS default credential chain), or `source://name` (a `[gateway.credential_source.<name>]`, asked per request). No other scheme. See below. Beside a backend it must be `env://`, and it is phantom-only: the box provisions the placeholder and strips it, and never injects the real destination credential (the backend handles the destination's auth). |
 | `backends.url` | — | A single backend this destination re-routes to, as `scheme://host[:port][/prefix]` (`https` or `http`; a path prefix is allowed, a query or fragment is not). Box dials the backend, presents the backend host (SNI, certificate, and `Host`), prepends the `url`'s path prefix to the agent's path, and keeps the original destination and path in policy and audit. At most one. |
 | `backends.auth.ref` | — | `env://NAME` for the backend's own token. The box attaches it (no phantom; it takes `backends.auth.header`, `backends.auth.placement`, `backends.auth.prefix`, `backends.auth.param`, but no `inject` or `phantom_prefix`). A signed (`aws://` or `credsd://`) auth is refused, and an auth needs an `https` backend. |
-| `secret.placement` | `header` | Where the credential lands: `header`, `basic_auth`, or `query_param`. |
+| `secret.env` | required for `source://` | The variable the phantom of a `source://` route is placed in. `source://` only. |
+| `secret.placement` | `header` | Where the credential lands: `header`, `basic_auth`, or `query_param`. A `source://` route refuses `query_param`. |
 | `secret.header` | `Authorization` | The header the credential is attached under. `header` placement only. |
 | `secret.prefix` | `Bearer ` for `Authorization`, else empty | Literal text prepended to the credential in the header value. `header` placement only, and carries no braces. |
 | `secret.param` | required for `query_param` | The query-parameter name the credential is attached under. |
-| `secret.inject` | `phantom` | When the gateway attaches the real secret. `phantom` attaches it only to a request that carries the route's phantom, and refuses any other; `always` attaches it to every request to the destinations, and warns. `env://` only. |
-| `secret.phantom_prefix` | `strands_box_` | The literal prefix the minted phantom carries, before its random suffix. `env://` only, so a harness that checks its key format accepts the phantom. |
+| `secret.inject` | `phantom` | When the gateway attaches the real secret. `phantom` attaches it only to a request that carries the route's phantom, and refuses any other; `always` attaches it to every request to the destinations, and warns. `env://` and `source://` only. |
+| `secret.phantom_prefix` | `strands_box_` | The literal prefix the minted phantom carries, before its random suffix. `env://` and `source://` only, so a harness that checks its key format accepts the phantom. |
 
 The entry carries no credential-type key, so a `secret.type` on any scheme is an unknown key the box
 refuses.

@@ -157,6 +157,21 @@ fn judge_filesystem(
             authority_directories.push(directory);
         }
     }
+    // The directory that holds a credential source's socket is kept out of the workload's reach: a
+    // workload that could connect to the socket could ask for a credential itself. It is subtracted
+    // from every tree that encloses it, and a grant that is that directory or lies inside it is
+    // refused below. The record keeps the directory canonical.
+    let socket_directories: Vec<PathBuf> = stored
+        .gateway
+        .credential_source
+        .values()
+        .filter_map(|source| source.socket_path()?.parent().map(Path::to_path_buf))
+        .collect();
+    for directory in &socket_directories {
+        if !authority_directories.contains(directory) {
+            authority_directories.push(directory.clone());
+        }
+    }
     let context = FilesystemContext {
         table,
         operator_home: &canonical_home,
@@ -171,7 +186,24 @@ fn judge_filesystem(
             program_search_directories(&std::env::var_os("PATH").unwrap_or_default())
         },
     };
-    Ok(filesystem::direct_grants(&spec.filesystem, &context)?)
+    let reach = filesystem::direct_grants(&spec.filesystem, &context)?;
+    if let Some((grant, directory)) = reach.grants.iter().find_map(|grant| {
+        socket_directories
+            .iter()
+            .find(|directory| grant.resolved.starts_with(directory))
+            .map(|directory| (grant, directory))
+    }) {
+        return Err(ConfigError::Filesystem {
+            table: table.to_string(),
+            entry: grant.authored.clone(),
+            reason: format!(
+                "{} holds a credential source's socket, which the workload may not reach",
+                directory.display()
+            ),
+        }
+        .into());
+    }
+    Ok(reach)
 }
 
 /// Where a process's network egress goes.

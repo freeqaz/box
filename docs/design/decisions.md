@@ -2378,10 +2378,12 @@ remain in its heap without wiping.
 <a id="an-undeliverable-credential-is-refused-at-load"></a>
 ### A credential the box cannot deliver is refused when the config loads
 
-A box egress entry may name the `env://` or `aws://` credential scheme. Every other scheme is
-refused when the config loads, and the message names the accepted set. The credentials crate also
-resolves `file://` and `op://`. Box cannot deliver those credentials, so egress entries cannot name
-those schemes. `an_undeliverable_credential_scheme_is_refused` pins the refusal.
+A box egress entry may name the `env://`, `aws://`, `credsd://`, or `source://` credential scheme.
+Every other scheme is refused when the config loads, and the message names the accepted set. The
+credentials crate also resolves `file://` and `op://`. Box cannot deliver those credentials, so
+egress entries cannot name those schemes. `an_undeliverable_credential_scheme_is_refused` pins the
+refusal. A `source://` route must also name a `[gateway.credential_source.<name>]` that the same
+file declares, and `a_source_route_needs_its_declared_source` pins that refusal.
 
 <a id="endpoint-breadth-is-refused-by-the-parsed-pattern"></a>
 ### Endpoint breadth is refused by the parsed pattern, and never by its text

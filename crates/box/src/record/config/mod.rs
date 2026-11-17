@@ -74,6 +74,9 @@ pub(super) const AWS_SCHEME: &str = "aws";
 /// The locator scheme naming a credsd credential source, whose type the daemon reports per request.
 pub(super) const CREDSD_SCHEME: &str = "credsd";
 
+/// The locator scheme naming a `[gateway.credential_source.<name>]` the gateway asks per request.
+pub(super) const SOURCE_SCHEME: &str = "source";
+
 /// The locator scheme that provisions a phantom into the workload's environment.
 pub(super) const ENV_SCHEME: &str = "env://";
 
@@ -499,6 +502,9 @@ impl RunContract {
         if let Some(source) = policy_source {
             sources.push(source);
         }
+        let mut gateway = self.file.gateway.clone();
+        validate_credential_sources(&gateway, &egress, &remote_mcp)?;
+        let credential_source_pems = read_credential_sources(&mut gateway, root, &mut sources)?;
         Ok(ConfigureRequest {
             record: Record {
                 version: record_version(
@@ -517,11 +523,11 @@ impl RunContract {
                         .as_ref()
                         .is_some_and(|agent| !agent.ingress.is_empty()),
                     has_backend(&egress, &remote_mcp),
-                    &self.file.gateway,
+                    &gateway,
                 ),
                 experimental_features: self.file.experimental_features.clone(),
                 file_attributes: self.file.file_attributes,
-                gateway: self.file.gateway.clone(),
+                gateway,
                 limits: self.file.limits.clone(),
                 box_id: root.box_id().to_string(),
                 box_dir: root.root().to_path_buf(),
@@ -538,8 +544,105 @@ impl RunContract {
             policy,
             grammars: self.grammars,
             sources,
+            credential_source_pems,
         })
     }
+}
+
+/// Refuse a `source://` route that names no `[gateway.credential_source.<name>]`.
+fn validate_credential_sources(
+    gateway: &Gateway,
+    egress: &BTreeMap<String, EgressEntry>,
+    remote_mcp: &BTreeMap<String, EgressEntry>,
+) -> Result<(), ConfigError> {
+    for (name, entry) in egress.iter().chain(remote_mcp) {
+        let Some(source) = entry
+            .secret
+            .as_ref()
+            .and_then(|secret| secret.credential_source())
+        else {
+            continue;
+        };
+        if !gateway.credential_source.contains_key(source) {
+            return Err(ConfigError::Contract {
+                reason: format!(
+                    "`[egress.{name}]` names source://{source}, and no \
+                     `[gateway.credential_source.{source}]` declares it"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Read each credential source's CA file as an authority source, and keep each Unix socket path
+/// canonical, so the stored record names the files the box trusts and the directory it protects.
+/// Returns each source's CA text by source name.
+fn read_credential_sources(
+    gateway: &mut Gateway,
+    root: &crate::record::layout::BoxRoot,
+    sources: &mut Vec<AuthoritySource>,
+) -> Result<BTreeMap<String, String>, BoxError> {
+    let mut pems = BTreeMap::new();
+    let config_path = sources[0].path().to_path_buf();
+    for (name, source) in &mut gateway.credential_source {
+        let inside_box = |path: &Path, what: &str| -> Result<(), BoxError> {
+            if crate::record::layout::lies_within(path, root.root()) {
+                return Err(ConfigError::Contract {
+                    reason: format!(
+                        "`[gateway.credential_source.{name}]` {what} {} is inside `box_dir` {}",
+                        path.display(),
+                        root.root().display()
+                    ),
+                }
+                .into());
+            }
+            Ok(())
+        };
+        if let Some(socket) = source.socket_path().map(Path::to_path_buf) {
+            // The socket need not exist yet, but its directory must: the box keeps that directory
+            // out of every workload grant, so it must know where it is.
+            let (Some(directory), Some(file_name)) = (socket.parent(), socket.file_name()) else {
+                return Err(ConfigError::Contract {
+                    reason: format!(
+                        "`[gateway.credential_source.{name}]` endpoint {} names no socket file",
+                        socket.display()
+                    ),
+                }
+                .into());
+            };
+            let directory =
+                directory
+                    .canonicalize()
+                    .map_err(|source| ConfigError::AuthorityRead {
+                        kind: "credential source socket directory",
+                        path: directory.to_path_buf(),
+                        source,
+                    })?;
+            let canonical = directory.join(file_name);
+            inside_box(&canonical, "endpoint")?;
+            source.endpoint = format!("unix://{}", canonical.display());
+        }
+        if let Some(path) = source.ca_path(&config_path) {
+            let (authority, pem) = AuthoritySource::read(&path, "credential source CA")?;
+            inside_box(authority.path(), "ca_file")?;
+            // The gateway's own reading, so a file accepted here cannot fail the gateway's start
+            // after the workload is announced, and a refusal names the file.
+            egress_gateway::CredentialSource::new(name.as_str(), &source.endpoint)
+                .and_then(|checked| checked.trusting(pem.clone()).check())
+                .map_err(|error| ConfigError::Contract {
+                    reason: format!(
+                        "`[gateway.credential_source.{name}]` ca_file {} is refused: {error}",
+                        authority.path().display()
+                    ),
+                })?;
+
+            source.ca_file = Some(authority.path().to_path_buf());
+            sources.push(authority);
+            pems.insert(name.clone(), pem);
+        }
+    }
+    Ok(pems)
 }
 
 /// What `configure` was given, validated.
@@ -555,6 +658,9 @@ pub(crate) struct ConfigureRequest {
 
     /// The loaded source identities that the interpreters protect from mutation.
     pub(crate) sources: Vec<AuthoritySource>,
+
+    /// The PEM text of each `[gateway.credential_source.<name>] ca_file`, by source name.
+    pub(crate) credential_source_pems: BTreeMap<String, String>,
 }
 
 impl ConfigureRequest {
@@ -692,6 +798,9 @@ pub(crate) const SUPPLIED_IDENTITY_RECORD_VERSION: u32 = 34;
 /// The record version of a record whose process selects `file-watching`, so an older build
 /// refuses the box rather than resuming it with FSEvents refused.
 const FILE_WATCHING_RECORD_VERSION: u32 = 35;
+/// The record version of a record whose `[gateway]` declares a credential source, so an older
+/// build refuses the box rather than resuming it with its `source://` routes undeliverable.
+const CREDENTIAL_SOURCE_RECORD_VERSION: u32 = 36;
 
 /// Experimental mechanisms require explicit operator selection.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -746,13 +855,15 @@ fn record_version<'a>(
     has_backend: bool,
     gateway: &Gateway,
 ) -> u32 {
-    if specs.clone().any(|spec| spec.file_watching) {
+    if !gateway.credential_source.is_empty() {
+        CREDENTIAL_SOURCE_RECORD_VERSION
+    } else if specs.clone().any(|spec| spec.file_watching) {
         FILE_WATCHING_RECORD_VERSION
     } else if !generated_box_identity(box_id) {
         SUPPLIED_IDENTITY_RECORD_VERSION
     } else if limits.shell.has_stdin_limit() {
         SHELL_STDIN_LIMIT_RECORD_VERSION
-    } else if !gateway.is_default() {
+    } else if !gateway.upgrade_http.is_empty() {
         UPGRADE_HTTP_RECORD_VERSION
     } else if limits.shell.has_size_limits() {
         SHELL_SIZE_LIMITS_RECORD_VERSION
@@ -1041,6 +1152,7 @@ impl Record {
             SHELL_STDIN_LIMIT_RECORD_VERSION,
             SUPPLIED_IDENTITY_RECORD_VERSION,
             FILE_WATCHING_RECORD_VERSION,
+            CREDENTIAL_SOURCE_RECORD_VERSION,
         ]
         .contains(&stamped.version)
         {
@@ -1085,6 +1197,7 @@ impl Record {
         }
         BoxName::parse(&record.name)?;
         record.gateway.validate()?;
+        validate_credential_sources(&record.gateway, &record.egress, &record.remote_mcp)?;
         record.validate_processes()?;
         Ok(record)
     }
@@ -2807,6 +2920,7 @@ native-filesystem-policy = false
                     protocol: Protocol::Http,
                     secret: Some(EgressSecret {
                         reference: format!("env://{variable}"),
+                        env: None,
                         header: Some("x-api-key".to_string()),
                         prefix: None,
                         placement: None,
@@ -3017,7 +3131,7 @@ env = {}
     /// A foreign version refuses, and the refusal names BOTH versions.
     #[test]
     fn a_record_from_another_format_is_refused() {
-        for found in [RECORD_VERSION - 1, FILE_WATCHING_RECORD_VERSION + 1] {
+        for found in [RECORD_VERSION - 1, CREDENTIAL_SOURCE_RECORD_VERSION + 1] {
             let text = format!("version = {found}\n");
 
             let error = parsed_record(&text).expect_err("a foreign version must be refused");
@@ -3300,6 +3414,7 @@ env = {}
                         protocol: Protocol::Http,
                         secret: Some(EgressSecret {
                             reference: "env://ONE".to_string(),
+                            env: None,
                             header: None,
                             prefix: None,
                             placement: None,
@@ -3318,6 +3433,7 @@ env = {}
                         protocol: Protocol::Http,
                         secret: Some(EgressSecret {
                             reference: "env://TWO".to_string(),
+                            env: None,
                             header: None,
                             prefix: None,
                             placement: None,
@@ -3351,6 +3467,7 @@ env = {}
                     protocol: Protocol::Http,
                     secret: Some(EgressSecret {
                         reference: "env://ONE".to_string(),
+                        env: None,
                         header: None,
                         prefix: None,
                         placement: None,
@@ -3407,6 +3524,7 @@ env = {}
                 protocol: Protocol::Http,
                 secret: Some(EgressSecret {
                     reference: "env://ONE".to_string(),
+                    env: None,
                     header: None,
                     prefix: None,
                     placement: None,
@@ -3797,6 +3915,14 @@ env = {}
     /// Write a box.toml whose body (the `[egress.*]`/`[mcp.*]` tables) is `body`, run it through
     /// `into_request`, and return the stored record or the configuration error.
     fn record_from_config(body: &str) -> Result<Record, crate::error::BoxError> {
+        request_from_config(body, &[]).map(|request| request.record)
+    }
+
+    /// As `record_from_config`, with `files` written beside `box.toml` first, and the whole request kept.
+    fn request_from_config(
+        body: &str,
+        files: &[(&str, &str)],
+    ) -> Result<ConfigureRequest, crate::error::BoxError> {
         let directory = tempfile::tempdir().expect("configuration directory");
         crate::test_support::with_operator_home(directory.path(), || {
             let workspace = directory.path().join("workspace");
@@ -3831,12 +3957,202 @@ env = {}
                 .expect("lock opens")
                 .expect("box is free");
             root.settle_identity(None).expect("identity settles");
+            for (name, text) in files {
+                let path = directory.path().join(name);
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("file directory");
+                std::fs::write(path, text).expect("write file");
+            }
             RunContract::read(&config_path, &workspace)
                 .expect("run contract loads")
                 .into_request(&root)
-                .map(|request| request.record)
         })
     }
+
+    /// A `source://` route and the `[gateway.credential_source.<name>]` it names. `SOCKET` stands
+    /// for the socket's absolute path.
+    const SOURCE_ROUTE: &str = "[gateway.credential_source.github]\n\
+         endpoint = \"unix://SOCKET\"\n\
+         [egress.github]\ndestinations = [\"api.github.com\"]\n\
+         secret.ref = \"source://github\"\nsecret.env = \"GITHUB_TOKEN\"\n\
+         secret.prefix = \"token \"\n";
+
+    /// `SOURCE_ROUTE` with its socket at `socket`, an absolute path.
+    fn source_route(socket: &Path) -> String {
+        SOURCE_ROUTE.replace("SOCKET", &socket.display().to_string())
+    }
+
+    #[test]
+    fn a_credential_source_cannot_hide_in_a_legacy_record() {
+        let mut stored = record(None, BTreeMap::new());
+        stored.gateway.credential_source.insert(
+            "github".to_string(),
+            gateway::CredentialSource {
+                endpoint: "unix:///run/source.sock".to_string(),
+                ca_file: None,
+                bearer: None,
+                timeout_ms: None,
+                max_body_bytes: None,
+            },
+        );
+        for found in [
+            RECORD_VERSION,
+            UPGRADE_HTTP_RECORD_VERSION,
+            FILE_WATCHING_RECORD_VERSION,
+        ] {
+            stored.version = found;
+            assert!(
+                matches!(
+                    Record::parse(&toml::to_string(&stored).unwrap(), Path::new("record.toml")),
+                    Err(ConfigError::RecordVersion {
+                        found: refused,
+                        expected: CREDENTIAL_SOURCE_RECORD_VERSION
+                    }) if refused == found
+                ),
+                "version {found}"
+            );
+        }
+        stored.version = CREDENTIAL_SOURCE_RECORD_VERSION;
+        let encoded = toml::to_string(&stored).unwrap();
+        assert_eq!(
+            Record::parse(&encoded, Path::new("record.toml")).unwrap(),
+            stored
+        );
+    }
+
+    #[test]
+    fn a_source_route_loads_with_its_socket_canonical() {
+        let directory = tempfile::tempdir().expect("socket directory");
+        let socket = directory.path().join("source.sock");
+        let request = request_from_config(&source_route(&socket), &[]).expect("accepted");
+        assert_eq!(request.record.version, CREDENTIAL_SOURCE_RECORD_VERSION);
+        let stored = &request.record.gateway.credential_source["github"];
+        let canonical = directory
+            .path()
+            .canonicalize()
+            .expect("canonical")
+            .join("source.sock");
+        assert_eq!(stored.socket_path(), Some(canonical.as_path()));
+        assert!(request.credential_source_pems.is_empty());
+        let routes = request.record.egress_routes().expect("routes");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].provisioned_name(), Some("GITHUB_TOKEN"));
+        assert!(routes[0].to_route_spec().is_ok());
+        assert_eq!(
+            Record::parse(&request.record.to_toml().unwrap(), Path::new("record.toml")).unwrap(),
+            request.record
+        );
+    }
+
+    #[test]
+    fn a_source_route_needs_its_declared_source() {
+        let refusal = record_from_config(
+            "[egress.github]\ndestinations = [\"api.github.com\"]\n\
+             secret.ref = \"source://github\"\nsecret.env = \"GITHUB_TOKEN\"\n",
+        )
+        .expect_err("refused")
+        .to_string();
+        assert!(
+            refusal.contains("no `[gateway.credential_source.github]` declares it"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_source_socket_inside_the_box_directory_is_refused() {
+        let directory = tempfile::tempdir().expect("configuration directory");
+        let box_directory = directory.path().join("box");
+        std::fs::create_dir(&box_directory).expect("box directory");
+        let refusal = crate::test_support::with_operator_home(directory.path(), || {
+            let workspace = directory.path().join("workspace");
+            std::fs::create_dir(&workspace).expect("workspace");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&box_directory, std::fs::Permissions::from_mode(0o700))
+                    .expect("private box directory");
+            }
+            std::fs::write(
+                directory.path().join("policy.dw"),
+                "permit (principal, action == Box::Action::\"net:connect\", resource);\n",
+            )
+            .expect("write policy");
+            let config_path = directory.path().join("box.toml");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "name = \"codex\"\nbox_dir = {:?}\npolicy = \"policy.dw\"\n{}",
+                    box_directory.display().to_string(),
+                    source_route(&box_directory.join("source.sock")),
+                ),
+            )
+            .expect("write configuration");
+            let mut root = crate::record::layout::BoxRoot::open_directory(&box_directory)
+                .expect("box directory opens");
+            root.initialize().expect("box layout initializes");
+            let _lock = crate::run::lock::Lock::try_acquire(&root.lock())
+                .expect("lock opens")
+                .expect("box is free");
+            root.settle_identity(None).expect("identity settles");
+            RunContract::read(&config_path, &workspace)
+                .expect("run contract loads")
+                .into_request(&root)
+                .err()
+                .expect("refused")
+                .to_string()
+        });
+        assert!(refusal.contains("inside `box_dir`"), "{refusal}");
+    }
+
+    #[test]
+    fn a_source_ca_file_is_read_as_a_protected_source() {
+        let body = "[gateway.credential_source.github]\n\
+             endpoint = \"https://source.example.com/release\"\n\
+             ca_file = \"source-ca.pem\"\nbearer = \"env://SOURCE_TOKEN\"\n\
+             [egress.github]\ndestinations = [\"api.github.com\"]\n\
+             secret.ref = \"source://github\"\nsecret.env = \"GITHUB_TOKEN\"\n";
+        let request =
+            request_from_config(body, &[("source-ca.pem", SOURCE_CA_PEM)]).expect("accepted");
+        assert_eq!(
+            request
+                .credential_source_pems
+                .get("github")
+                .map(String::as_str),
+            Some(SOURCE_CA_PEM)
+        );
+        assert_eq!(
+            request.sources.len(),
+            3,
+            "configuration, policy, and the CA file"
+        );
+        let stored = request.record.gateway.credential_source["github"]
+            .ca_file
+            .as_deref()
+            .expect("the record keeps the file it trusts");
+        assert!(stored.is_absolute(), "{}", stored.display());
+        assert!(
+            request_from_config(body, &[]).is_err(),
+            "a missing CA file is refused"
+        );
+        let refusal = request_from_config(body, &[("source-ca.pem", "not a certificate\n")])
+            .err()
+            .expect("a file with no certificate is refused")
+            .to_string();
+        assert!(refusal.contains("source-ca.pem"), "{refusal}");
+    }
+
+    /// A CA certificate with no key, for a source's `ca_file`.
+    const SOURCE_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBtjCCAVugAwIBAgIUQVaeNQHvFMoSYmbLGKAQph1hIDMwCgYIKoZIzj0EAwIw\n\
+JzElMCMGA1UEAwwcU3RyYW5kcyBCb3ggdGVzdCB1cHN0cmVhbSBDQTAgFw0yNjEx\n\
+MTYyMzQ4MDlaGA8yMTI2MTAyMzIzNDgwOVowJzElMCMGA1UEAwwcU3RyYW5kcyBC\n\
+b3ggdGVzdCB1cHN0cmVhbSBDQTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABFM5\n\
+zZttZSwGgijtclopiKnKYyT3t23OCdW81oXQs7meeR1pBoG9lW5ENeFjxtlSDct9\n\
+FklyoCSmGjjqYPscqumjYzBhMB0GA1UdDgQWBBRgqbTRveHuiNWFKKJBM8AYBO2I\n\
+JDAfBgNVHSMEGDAWgBRgqbTRveHuiNWFKKJBM8AYBO2IJDAPBgNVHRMBAf8EBTAD\n\
+AQH/MA4GA1UdDwEB/wQEAwIBBjAKBggqhkjOPQQDAgNJADBGAiEApD8FNLLRV3Z3\n\
+xvEQKiqvrbCfTGhjmNqHrCdDuwH8FW4CIQDMa23UzSKxvSOr5dR4L+xwJBJ1eGCm\n\
+TLkvUbcKVVrEFw==\n\
+-----END CERTIFICATE-----\n";
 
     /// Two stdio servers on distinct programs, as `box.toml` tables.
     const DISTINCT_PROGRAMS: &str = "[mcp.fetch]\ntype = \"stdio\"\ncommand = [\"mcp-server-fetch\"]\n\
