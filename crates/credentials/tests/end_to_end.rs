@@ -1659,3 +1659,264 @@ mod credsd_e2e {
         assert_unknown_environment(&error, &environment);
     }
 }
+
+// --- request-time routes -------------------------------------------------------------------------
+
+/// A vault over one request-time route for `destination`, naming the source `control-plane`.
+fn request_time_vault(
+    destination: &str,
+    inject: InjectMode,
+    check: PhantomCheck,
+) -> (Vault, String) {
+    let opened = Vault::open(
+        VaultConfig::new(Backend::local(), "tenant").route(
+            RouteSpec::request_time(
+                DestinationPattern::parse(destination).unwrap(),
+                "control-plane",
+                inject,
+            )
+            .phantom_check(check),
+        ),
+    )
+    .expect("a request-time route resolves nothing at open");
+    let phantom = opened.phantoms()[0].token().to_string();
+    (opened.into_vault(), phantom)
+}
+
+/// A request-time route mints one placeholder and resolves nothing, so it opens with no secret
+/// present anywhere.
+#[test]
+fn a_request_time_route_opens_with_a_phantom_and_no_secret() {
+    let opened = Vault::open(
+        VaultConfig::new(Backend::local(), "tenant")
+            .require_every_route()
+            .route(RouteSpec::request_time(
+                DestinationPattern::parse("api.example.com").unwrap(),
+                "control-plane",
+                header("token {}"),
+            )),
+    )
+    .expect("nothing to resolve");
+    assert_eq!(opened.phantoms().len(), 1);
+    assert!(opened.skipped().is_empty());
+}
+
+/// Routes that name one source with one prefix share one placeholder, as routes that name one
+/// secret do, so one variable in the workload serves both destinations.
+#[test]
+fn routes_naming_one_source_share_one_phantom() {
+    let opened = Vault::open(
+        VaultConfig::new(Backend::local(), "tenant")
+            .route(RouteSpec::request_time(
+                DestinationPattern::parse("api.example.com").unwrap(),
+                "control-plane",
+                header("token {}"),
+            ))
+            .route(RouteSpec::request_time(
+                DestinationPattern::parse("git.example.com").unwrap(),
+                "control-plane",
+                InjectMode::basic_auth(),
+            )),
+    )
+    .unwrap();
+    let phantoms = opened.phantoms();
+    assert_eq!(phantoms.len(), 2, "one mapping per destination");
+    assert_eq!(phantoms[0].token(), phantoms[1].token());
+}
+
+/// The request leg checks and strips the placeholder, attaches nothing, and names the source the
+/// caller must ask.
+#[test]
+fn a_request_time_route_strips_the_placeholder_and_names_its_source() {
+    let (vault, phantom) =
+        request_time_vault("api.example.com", header("token {}"), PhantomCheck::Strict);
+    let headers = vec![("Authorization".to_string(), format!("token {phantom}"))];
+    let attachment = vault
+        .attach_for(bearer_request(
+            dest("api.example.com", 443, "/repos"),
+            &headers,
+            "https://api.example.com/repos",
+        ))
+        .expect("the placeholder matches")
+        .expect("the destination is governed");
+    assert_eq!(attachment.credential_source(), Some("control-plane"));
+    assert_eq!(
+        attachment.set_headers().count(),
+        0,
+        "nothing attaches before the source answers"
+    );
+    assert!(
+        attachment
+            .strip_headers()
+            .any(|name| name.eq_ignore_ascii_case("Authorization")),
+        "the placeholder never rides on: {attachment:?}"
+    );
+    assert_eq!(attachment.advisory_reason(), None);
+}
+
+/// A `phantom` route refuses a request without its placeholder before any source is asked.
+#[test]
+fn a_strict_request_time_route_refuses_a_request_without_its_placeholder() {
+    let (vault, _) =
+        request_time_vault("api.example.com", header("token {}"), PhantomCheck::Strict);
+    for headers in [
+        Vec::new(),
+        vec![(
+            "Authorization".to_string(),
+            "token not-the-phantom".to_string(),
+        )],
+    ] {
+        let refused = vault.attach_for(bearer_request(
+            dest("api.example.com", 443, "/"),
+            &headers,
+            "https://api.example.com/",
+        ));
+        assert!(refused.is_err(), "{headers:?}");
+    }
+}
+
+/// An `always` route defers to its source without a placeholder, and the advisory is journalled.
+#[test]
+fn an_always_request_time_route_defers_without_a_placeholder() {
+    let (vault, _) = request_time_vault(
+        "git.example.com",
+        InjectMode::basic_auth(),
+        PhantomCheck::Advisory,
+    );
+    let attachment = vault
+        .attach_for(bearer_request(
+            dest("git.example.com", 443, "/o/r.git/info/refs"),
+            &[],
+            "https://git.example.com/o/r.git/info/refs",
+        ))
+        .expect("advisory attaches without a placeholder")
+        .expect("governed");
+    assert_eq!(attachment.credential_source(), Some("control-plane"));
+    assert!(attachment.advisory_reason().is_some());
+}
+
+/// The released value attaches at the operator's placement, for one request.
+#[test]
+fn a_released_value_attaches_at_the_operator_placement() {
+    let cases = [
+        (header("token {}"), "ghs_released", "token ghs_released"),
+        (
+            InjectMode::basic_auth(),
+            "x-access-token:ghs_released",
+            "Basic eC1hY2Nlc3MtdG9rZW46Z2hzX3JlbGVhc2Vk",
+        ),
+    ];
+    for (inject, value, wire) in cases {
+        let (vault, _) = request_time_vault("api.example.com", inject, PhantomCheck::Advisory);
+        let (attachment, _) = vault
+            .attach_released(
+                dest("api.example.com", 443, "/"),
+                zeroize::Zeroizing::new(value.to_string()),
+            )
+            .expect("a usable value attaches")
+            .expect("the destination is governed");
+        let set: Vec<(String, String)> = attachment
+            .set_headers()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        assert_eq!(set, vec![("Authorization".to_string(), wire.to_string())]);
+        assert_eq!(
+            attachment.credential_source(),
+            None,
+            "the attachment is complete"
+        );
+        assert!(
+            !format!("{attachment:?}").contains(value),
+            "Debug never prints the released value"
+        );
+    }
+}
+
+/// The exchange's redactor scrubs the released value from that exchange's response.
+#[test]
+fn a_released_value_is_scrubbed_from_its_exchange_response() {
+    let (vault, _) = request_time_vault(
+        "api.example.com",
+        header("token {}"),
+        PhantomCheck::Advisory,
+    );
+    let (_, mut redactor) = vault
+        .attach_released(
+            dest("api.example.com", 443, "/"),
+            zeroize::Zeroizing::new("ghs_echoed_value".to_string()),
+        )
+        .unwrap()
+        .unwrap();
+    drop(vault);
+    assert_eq!(
+        redactor.redact_header("token ghs_echoed_value").as_deref(),
+        Some("token [REDACTED]")
+    );
+    let mut body = redactor.push(br#"{"echo":"ghs_ech"#);
+    body.extend(redactor.push(br#"oed_value"}"#));
+    body.extend(redactor.finish());
+    assert_eq!(body, br#"{"echo":"[REDACTED]"}"#);
+}
+
+/// A released value goes through the same content rule as every resolved secret, and a destination
+/// no request-time route governs takes none.
+#[test]
+fn an_unusable_or_unbound_released_value_is_refused() {
+    let (vault, _) = request_time_vault(
+        "api.example.com",
+        header("token {}"),
+        PhantomCheck::Advisory,
+    );
+    for value in ["", "   ", "line\r\nx-injected: 1", "nul\0"] {
+        assert!(
+            vault
+                .attach_released(
+                    dest("api.example.com", 443, "/"),
+                    zeroize::Zeroizing::new(value.to_string())
+                )
+                .is_err(),
+            "{value:?}"
+        );
+    }
+    assert!(
+        vault
+            .attach_released(
+                dest("other.example.com", 443, "/"),
+                zeroize::Zeroizing::new("ghs_value".to_string())
+            )
+            .expect("an ungoverned destination is not an error")
+            .is_none()
+    );
+}
+
+/// A request-time route and an opaque route on one destination are ambiguous, so the request fails
+/// closed rather than the vault choosing a credential.
+#[test]
+fn a_request_time_route_beside_an_opaque_route_is_ambiguous() {
+    set_var("CREDENTIALS_E2E_REQUEST_TIME_OPAQUE", "opaque-secret");
+    let opened = Vault::open(
+        VaultConfig::new(Backend::local(), "tenant")
+            .route(RouteSpec::request_time(
+                DestinationPattern::parse("api.example.com").unwrap(),
+                "control-plane",
+                header("token {}"),
+            ))
+            .route(RouteSpec::opaque(
+                DestinationPattern::parse("*.example.com").unwrap(),
+                Locator::parse_uri("env://CREDENTIALS_E2E_REQUEST_TIME_OPAQUE").unwrap(),
+                header("Bearer {}"),
+            )),
+    )
+    .unwrap();
+    let vault = opened.into_vault();
+    assert!(
+        vault
+            .attach_for(bearer_request(
+                dest("api.example.com", 443, "/"),
+                &[],
+                "https://api.example.com/"
+            ))
+            .is_err()
+    );
+    clear_var("CREDENTIALS_E2E_REQUEST_TIME_OPAQUE");
+}

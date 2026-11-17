@@ -46,6 +46,7 @@ pub struct Attachment {
     strip_query: Vec<String>,
     set_query: Vec<(String, Zeroizing<String>)>,
     advisory: Option<String>,
+    credential_source: Option<String>,
 }
 
 impl Attachment {
@@ -57,6 +58,7 @@ impl Attachment {
             strip_query: Vec::new(),
             set_query: Vec::new(),
             advisory: None,
+            credential_source: None,
         }
     }
 
@@ -138,6 +140,18 @@ impl Attachment {
         self.advisory.as_deref()
     }
 
+    /// Record that this request's credential comes from the request-time source `name`.
+    pub(crate) fn defer_to_source(&mut self, name: impl Into<String>) {
+        self.credential_source = Some(name.into());
+    }
+
+    /// The request-time source the caller must ask for this request's credential, or `None` when
+    /// this attachment is complete. A request that names one carries no credential until the caller
+    /// attaches the source's value with [`Vault::attach_released`](crate::Vault::attach_released).
+    pub fn credential_source(&self) -> Option<&str> {
+        self.credential_source.as_deref()
+    }
+
     /// Whether this attachment asks for no edits at all.
     pub fn is_empty(&self) -> bool {
         self.strip_headers.is_empty()
@@ -145,6 +159,7 @@ impl Attachment {
             && self.rewrite_path.is_none()
             && self.strip_query.is_empty()
             && self.set_query.is_empty()
+            && self.credential_source.is_none()
     }
 }
 
@@ -176,6 +191,7 @@ impl std::fmt::Debug for Attachment {
                     .collect::<Vec<_>>(),
             )
             .field("advisory", &self.advisory)
+            .field("credential_source", &self.credential_source)
             .finish()
     }
 }

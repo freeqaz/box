@@ -27,8 +27,10 @@ the scrub of an echoed secret. `strands-box-egress-gateway` applies the edits to
 - Add a public item only for a named external caller. A type in a public signature stays public
   (`Destination`, `DestinationPattern`).
 - Keep these entry points: `Vault::open` (startup), `Vault::attach_for` (request leg),
-  `Vault::redact_leaks` (complete response), `Vault::response_redactor` (streamed response), and
-  `Backend::resolve` (one locator to plaintext). Both response methods return `None` when ambiguous.
+  `Vault::attach_released` (the request leg of a request-time route, after its source released the
+  value), `Vault::redact_leaks` (complete response), `Vault::response_redactor` (streamed response),
+  and `Backend::resolve` (one locator to plaintext). Both response methods return `None` when
+  ambiguous.
 - Do not re-split `attach_for` into `resolve_for`, `resolve_with_phantom`, and `get_aws`; a split
   makes validation the call site's choice.
 - Return no binding, secret, or "credential for this destination" from any accessor.
@@ -38,10 +40,13 @@ the scrub of an echoed secret. `strands-box-egress-gateway` applies the edits to
 - Declare no `pub trait`, and keep `SecretSource` and `Emitter` `pub(crate)`, so no caller supplies
   an unreviewed backend.
 - Keep `RouteSpec`'s fields sealed behind `opaque()`, `signed_aws()`, `box_owned()`, `strip_phantom()`,
-  and `harness_location()`. `box_owned()` attaches the box's own credential with no phantom and no
-  check (a re-route's backend token); `strip_phantom()` mints a placeholder the workload presents and
-  strips it, attaching nothing (a re-routed destination's own secret). Both compose in one
-  `attach_for` so one control carries a re-route (strip the placeholder, attach the backend token).
+  `request_time()`, and `harness_location()`. `box_owned()` attaches the box's own credential with
+  no phantom and no check (a re-route's backend token); `strip_phantom()` mints a placeholder the
+  workload presents and strips it, attaching nothing (a re-routed destination's own secret). Both
+  compose in one `attach_for` so one control carries a re-route (strip the placeholder, attach the
+  backend token). `request_time()` mints a placeholder and holds no secret: `attach_for` checks and
+  strips the placeholder and names the source, and `attach_released` attaches the value the source
+  released for that one request at the route's own placement.
 - Keep `DestinationPattern` shared with egress-gateway; use `as_written()` in operator text.
 
 ## Security Invariants

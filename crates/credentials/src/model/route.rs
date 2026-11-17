@@ -12,6 +12,10 @@ pub(crate) const AWS_SENTINEL_REF: &str = "aws-signed://route";
 /// placeholder, never dereferenced.
 pub(crate) const STRIP_SENTINEL_REF: &str = "strip-phantom://route";
 
+/// The scheme a request-time route's `credential_ref` carries, as `source://<name>`. No source
+/// resolves it: the caller obtains the value per request and hands it to the vault.
+pub(crate) const REQUEST_TIME_SCHEME: &str = "source";
+
 /// How strictly the vault checks the Phantom_Token before it attaches the Real_Secret.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PhantomCheck {
@@ -63,6 +67,21 @@ pub(crate) enum RouteKind {
         /// Where the harness places the placeholder, so the vault strips it before the request egresses.
         harness: InjectMode,
         /// The literal prefix the minted placeholder carries, before its 64 hex chars.
+        phantom_prefix: String,
+    },
+    /// A credential obtained for each request from a named source, standing behind a phantom. The
+    /// vault resolves nothing at open: it checks and strips the phantom, names the source on the
+    /// attachment, and attaches the value the caller obtained for that one request.
+    RequestTime {
+        /// The source the caller asks for each request's credential.
+        source: String,
+        /// How the obtained value is attached to the outbound request.
+        inject: InjectMode,
+        /// Where the harness has already placed the Phantom_Token.
+        harness: InjectMode,
+        /// How strictly the vault checks the placeholder before the caller asks the source.
+        phantom_check: PhantomCheck,
+        /// The literal prefix the minted Phantom_Token carries, before its 64 hex chars.
         phantom_prefix: String,
     },
 }
@@ -154,10 +173,37 @@ impl RouteSpec {
         }
     }
 
+    /// A **request-time** route: the vault mints a placeholder and resolves nothing. For each request
+    /// to the destination it checks and strips the placeholder and names `source` on the
+    /// [`Attachment`](crate::Attachment); the caller asks that source for the credential and attaches
+    /// the value through [`Vault::attach_released`](crate::Vault::attach_released), at `inject`.
+    #[must_use]
+    pub fn request_time(
+        destination: DestinationPattern,
+        source: impl Into<String>,
+        inject: InjectMode,
+    ) -> Self {
+        let source = source.into();
+        Self {
+            destination,
+            credential_ref: Locator::Uri(format!("{REQUEST_TIME_SCHEME}://{source}")),
+            kind: RouteKind::RequestTime {
+                source,
+                harness: inject.clone(),
+                inject,
+                phantom_check: PhantomCheck::Strict,
+                phantom_prefix: DEFAULT_PHANTOM_PREFIX.to_string(),
+            },
+        }
+    }
+
     /// Declare that the harness places the Phantom_Token somewhere other than where the real secret
     /// attaches.
     pub fn harness_location(mut self, mode: InjectMode) -> Result<Self> {
         if let RouteKind::Opaque {
+            harness, inject, ..
+        }
+        | RouteKind::RequestTime {
             harness, inject, ..
         } = &mut self.kind
         {
@@ -177,7 +223,9 @@ impl RouteSpec {
     /// Set how strictly the vault checks this route's Phantom_Token; a signed route ignores it.
     #[must_use]
     pub fn phantom_check(mut self, mode: PhantomCheck) -> Self {
-        if let RouteKind::Opaque { phantom_check, .. } = &mut self.kind {
+        if let RouteKind::Opaque { phantom_check, .. }
+        | RouteKind::RequestTime { phantom_check, .. } = &mut self.kind
+        {
             *phantom_check = mode;
         }
         self
@@ -190,7 +238,8 @@ impl RouteSpec {
         check_phantom_prefix(&prefix)?;
         match &mut self.kind {
             RouteKind::Opaque { phantom_prefix, .. }
-            | RouteKind::StripPhantom { phantom_prefix, .. } => *phantom_prefix = prefix,
+            | RouteKind::StripPhantom { phantom_prefix, .. }
+            | RouteKind::RequestTime { phantom_prefix, .. } => *phantom_prefix = prefix,
             RouteKind::SignedAws { .. } | RouteKind::BoxOwned { .. } => {}
         }
         Ok(self)

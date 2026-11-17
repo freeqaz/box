@@ -49,12 +49,14 @@ route that names no profile then fails at signing time, per request, rather than
 than not starting: the request goes upstream bare, and the upstream's `401` reads
 like the boundary denying the call.
 
-A route is one of four kinds. **Opaque** (`RouteSpec::opaque`) — one secret attached
+A route is one of five kinds. **Opaque** (`RouteSpec::opaque`) — one secret attached
 at one location, standing behind a phantom. **Signed AWS**
-(`RouteSpec::signed_aws`), SigV4-signed across several headers. And two for a re-route to a backend:
+(`RouteSpec::signed_aws`), SigV4-signed across several headers. Two for a re-route to a backend:
 **box-owned** (`RouteSpec::box_owned`) attaches the box's own credential — a backend token — at one
 location with no phantom; and **strip-phantom** (`RouteSpec::strip_phantom`) mints a placeholder the
-workload presents and strips it, attaching nothing (a re-routed destination's own secret). A signed
+workload presents and strips it, attaching nothing (a re-routed destination's own secret). And
+**request-time** (`RouteSpec::request_time`) mints a placeholder and holds no secret: the caller
+asks the named source for each request's value and attaches it with `attach_released`. A signed
 route takes no inject location and mints no phantom, because nothing is placed for
 the vault to recognize. Add `harness_location(mode)` to an opaque route when the
 workload presents the phantom somewhere other than where the real secret attaches. It returns
@@ -70,6 +72,7 @@ signed route the call is accepted and changes nothing, because there is no injec
 | `attach_for(&self, req: Outbound<'_>) -> Result<Option<Attachment>>` | What to edit before this request goes upstream, as an `Attachment` of header, path, and query edits. `Ok(None)` when this vault governs no credential for the destination. |
 | `redact_leaks(&self, res: Inbound<'_>) -> Option<Redactions>` | The `Redactions` a response needs because it echoed the injected secret back, or `None` when nothing leaked. It returns no `Result`: a response is already received, so there is nothing to fail closed on. |
 | `response_redactor(&self, destination: Destination<'_>) -> Option<ResponseRedactor>` | An owned scrubber for a streamed response, or `None` when no unique opaque binding matches. |
+| `attach_released(&self, destination: Destination<'_>, value: Zeroizing<String>) -> Result<Option<(Attachment, ResponseRedactor)>>` | The edits that attach a value a request-time source released for one request, at the route's own placement, and the scrubber for that request's response. `Ok(None)` when no request-time route governs the destination. An empty value, or one with a control character, is refused. |
 
 `ResponseRedactor` keeps credential material private and replaces exact secret occurrences with
 `[REDACTED]`. Use `redact_header()` for each header value and `push()` for each body chunk. Each

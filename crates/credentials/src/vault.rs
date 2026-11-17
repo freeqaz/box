@@ -134,6 +134,45 @@ impl StripBinding {
     }
 }
 
+/// One request-time binding: the source each request's credential comes from, how the value
+/// attaches, and the phantom standing in for it. It holds no secret: the caller obtains one value per
+/// request and hands it back through [`Vault::attach_released`].
+#[derive(Debug)]
+pub(crate) struct RequestTimeBinding {
+    /// The source the caller asks for each request's credential.
+    source: String,
+    /// How the obtained value attaches to the outbound request.
+    inject: InjectMode,
+    /// Where the harness placed the phantom, so it can be recognised and stripped.
+    harness: InjectMode,
+    /// The phantom minted to stand in for the credential (non-secret, unguessable).
+    phantom: PhantomToken,
+    /// How strictly the placeholder is checked before the caller asks the source.
+    phantom_check: PhantomCheck,
+}
+
+impl RequestTimeBinding {
+    pub(crate) fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub(crate) fn inject(&self) -> &InjectMode {
+        &self.inject
+    }
+
+    pub(crate) fn harness(&self) -> &InjectMode {
+        &self.harness
+    }
+
+    pub(crate) fn phantom(&self) -> &str {
+        self.phantom.as_str()
+    }
+
+    pub(crate) fn phantom_check(&self) -> PhantomCheck {
+        self.phantom_check
+    }
+}
+
 /// A signed-AWS route's resolved form: its config locator and an optional explicit `(service,
 /// region)` to sign under (a re-routed backend whose host carries no derivable scope).
 type SignedAwsRoute = (Locator, Option<(String, String)>);
@@ -150,6 +189,8 @@ pub struct Vault {
     box_owned: Vec<(DestinationPattern, BoxOwnedBinding)>,
     /// destination pattern → strip-phantom binding (strip the placeholder, attach nothing).
     strip: Vec<(DestinationPattern, StripBinding)>,
+    /// destination pattern → request-time binding (the credential is obtained per request).
+    request_time: Vec<(DestinationPattern, RequestTimeBinding)>,
     /// destination pattern → the structured AWS config a signed route signs with.
     signed_aws: Vec<(DestinationPattern, SignedAwsRoute)>,
     /// The backend, retained because a signed route resolves its credentials per request (they
@@ -217,6 +258,7 @@ impl Vault {
             opaque: Vec::new(),
             box_owned: Vec::new(),
             strip: Vec::new(),
+            request_time: Vec::new(),
             signed_aws: Vec::new(),
             backend,
             ambient_policy,
@@ -277,6 +319,43 @@ impl Vault {
                         route.destination().clone(),
                         StripBinding {
                             harness: harness.clone(),
+                        },
+                    ));
+                }
+                // A request-time route resolves nothing and mints a phantom to stand in for the
+                // credential its source releases per request. Routes that name one source with one
+                // prefix share one phantom, as routes that name one secret do.
+                RouteKind::RequestTime {
+                    source,
+                    inject,
+                    harness,
+                    phantom_check,
+                    phantom_prefix,
+                } => {
+                    let shared = minted.iter().find(|(locator, prefix, _)| {
+                        locator == route.credential_ref() && prefix == phantom_prefix
+                    });
+                    let phantom = match shared {
+                        Some((_, _, phantom)) => phantom.clone(),
+                        None => {
+                            let phantom = mint(phantom_prefix)?;
+                            minted.push((
+                                route.credential_ref().clone(),
+                                phantom_prefix.clone(),
+                                phantom.clone(),
+                            ));
+                            phantom
+                        }
+                    };
+                    phantoms.push(Phantom::new(route.destination().clone(), phantom.clone()));
+                    vault.request_time.push((
+                        route.destination().clone(),
+                        RequestTimeBinding {
+                            source: source.clone(),
+                            inject: inject.clone(),
+                            harness: harness.clone(),
+                            phantom,
+                            phantom_check: *phantom_check,
                         },
                     ));
                 }
@@ -506,9 +585,63 @@ impl Vault {
             }
             return Ok(Some(attachment));
         }
+        // A request-time binding attaches nothing here: it checks and strips the placeholder and
+        // names its source, and the caller attaches the source's value with `attach_released`.
+        if let Some(binding) = self.resolve_request_time(&req.destination)? {
+            return self.defer_to_source(binding, &req).map(Some);
+        }
         match self.resolve_opaque(&req.destination)? {
             Some(binding) => self.swap_phantom(binding, &req).map(Some),
             None => Ok(None),
+        }
+    }
+
+    /// The edits that attach `value`, the credential a request-time source released for one
+    /// request to `destination`, and the scrubber for that one exchange's response.
+    ///
+    /// The value is checked as every resolved secret is
+    /// (docs/design/decisions.md#an-unusable-secret-value-is-unrepresentable) and attached at the
+    /// operator's placement. The returned [`ResponseRedactor`] holds the value for that exchange
+    /// alone, so an upstream that echoes it does not return it to the workload. `None` when no
+    /// request-time binding governs `destination`.
+    pub fn attach_released(
+        &self,
+        destination: Destination<'_>,
+        value: zeroize::Zeroizing<String>,
+    ) -> Result<Option<(Attachment, ResponseRedactor)>> {
+        let Some(binding) = self.resolve_request_time(&destination)? else {
+            return Ok(None);
+        };
+        let reference = format!(
+            "{scheme}://{source}",
+            scheme = crate::model::REQUEST_TIME_SCHEME,
+            source = binding.source()
+        );
+        let secret = Secret::new(value, &reference)?;
+        let attachment = crate::legs::attach_released(binding, &secret);
+        Ok(Some((attachment, ResponseRedactor::new(&secret))))
+    }
+
+    /// Resolve the request-time binding for `dest`, failing closed when more than one binding of
+    /// either opaque or request-time kind matches it.
+    fn resolve_request_time(&self, dest: &Destination<'_>) -> Result<Option<&RequestTimeBinding>> {
+        let mut matched = self
+            .request_time
+            .iter()
+            .filter(|(pattern, _)| pattern.matches(dest))
+            .map(|(_, binding)| binding);
+        let first = matched.next();
+        let opaque = self.opaque.iter().any(|(pattern, _)| pattern.matches(dest));
+        match (first, matched.next()) {
+            (None, _) => Ok(None),
+            (Some(binding), None) if !opaque => Ok(Some(binding)),
+            _ => Err(CredentialError::Ambiguous(format!(
+                "{host}:{port}{path} matched more than one credential binding — \
+                 narrow the bindings so each destination matches exactly one",
+                host = dest.host,
+                port = dest.port,
+                path = dest.path,
+            ))),
         }
     }
 
