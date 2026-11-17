@@ -155,8 +155,9 @@ own query. Credential edits can add or remove query parameters. Removing the las
 an originally nonempty query still removes the delimiter.
 
 After `http:request` permits the request, the gateway opens TLS to the server. It verifies the
-server's certificate against a compiled-in set of public root certificates, then forwards the
-request. Each connection carries one request.
+server's certificate against a compiled-in set of public root certificates plus the operator's
+`[gateway] upstream_ca_file` ([why](./decisions.md#extra-upstream-roots-come-from-one-operator-file)), then
+forwards the request. Each connection carries one request.
 
 A request the gateway refuses gets a 403 with the header `x-strands-box-egress: refused`, and a body
 that says why. A `net:connect` refusal of a `CONNECT` arrives before the `200`, so the client never

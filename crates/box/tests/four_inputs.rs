@@ -54,6 +54,11 @@
 //! CONNECT to the same host, so the key changes which port a request is judged on and grants no
 //! reach a permit does not.
 //!
+//! `[gateway] upstream_ca_file` names CA certificates the gateway trusts, beside its public roots,
+//! when it verifies an upstream server. It decides which servers are authentic, not which requests
+//! are permitted: policy still judges every `net:connect` and `http:request`. The file is read as an
+//! authority source, so the workload cannot replace it, and the stored record keeps its path.
+//!
 //! `mcp` declares which local MCP servers exist, with a program and its argv. The configuration
 //! selects which servers can start, and `shell:spawn` decides each start. `mcp:call` decides each
 //! request on the stream the server answers. An entry selects and identifies; it grants no request on its own.
@@ -213,7 +218,7 @@ fn the_config_record_carries_only_the_four_inputs() {
         ],
         "the twelve config keys include execution limits, explicit experimental enforcement selection, \
          `file-attributes`, which widens only the workload's own write grants, and `[gateway]`, \
-         whose upgraded requests policy still decides. \
+         whose upgraded requests policy still decides and whose upstream CA file authorizes nothing. \
          Unknown keys must remain errors; any further input requires a deliberate contract change."
     );
 }

@@ -2297,6 +2297,33 @@ re-derive the service and region from the rewritten host.
 `an_aws_backend_auth_without_an_explicit_scope_is_refused`, and the credentials crate's
 `a_gateway_host_is_not_derived_and_needs_an_explicit_scope` pin it.
 
+<a id="extra-upstream-roots-come-from-one-operator-file"></a>
+### Extra upstream trust roots come from one operator-named file, and apply to every upstream
+
+A network that re-signs TLS traffic makes the built-in public roots fail for every re-signed host,
+and a private service the box is meant to reach has a certificate no public root signs. The key
+`[gateway] upstream_ca_file` names one PEM file, and the gateway trusts its certificates in addition
+to the built-in set when it verifies an upstream server. It lives in `[gateway]` because it is a
+setting of the one gateway every request goes through, and a new top-level key would widen the
+frozen key set. Only `box.toml` sets it, so the agent and the tools cannot. Box reads the file as an
+authority source, refuses a missing file, a file with no certificate, and a file inside `box_dir`,
+and checks the file again before the workload starts. It prints one line on stderr that names the
+file. The stored record keeps the canonical path at record version 36, so an older build refuses
+the box. A key on each `[egress.<name>]` entry lost, because the gateway holds one upstream trust
+configuration, and a per-entry key would need new per-destination matching on the TLS path.
+Honouring `SSL_CERT_FILE` in the trusted process lost, because Box composes its environment and
+does not inherit it. The roots are not the per-run CA the workload sees, and they add no allow
+authority, because the policy still decides what is reachable. The cost is that trust is
+gateway-wide: a root in the file can vouch for any host the policy permits, so the operator must
+vouch for every certificate in it. The gateway honours a root's name constraints, so a CA
+constrained to the operator's own domain narrows that cost without new matching on the TLS path
+(`a_name_constrained_root_vouches_only_for_its_names`). Box reads the file with the gateway's own
+parser before the workload starts, so a file the gateway would refuse is refused at load, naming
+the file. The other direct connections of the trusted process, telemetry export and
+`policy generate-schema`, keep the public roots only. The reading of the file is pinned by
+`an_upstream_ca_file_reaches_the_request_and_is_a_protected_source`, and the `box_dir` refusal by
+`an_upstream_ca_file_inside_the_box_directory_is_refused`.
+
 ## Credentials
 
 <a id="the-workload-holds-a-phantom-and-the-gateway-holds-the-secret"></a>

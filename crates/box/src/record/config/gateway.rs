@@ -1,6 +1,7 @@
 //! `[gateway]`: settings that apply to every request through the box's egress gateway.
 
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -14,11 +15,31 @@ pub(crate) struct Gateway {
     /// `https://` on port 443.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) upgrade_http: Vec<String>,
+
+    /// A PEM file of CA certificates the gateway trusts, in addition to its built-in public roots,
+    /// when it verifies an upstream server. Relative to the configuration file's directory unless
+    /// absolute; the stored record keeps the canonical path that was read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) upstream_ca_file: Option<PathBuf>,
 }
 
 impl Gateway {
     pub(super) fn is_default(&self) -> bool {
-        self.upgrade_http.is_empty()
+        self.upgrade_http.is_empty() && self.upstream_ca_file.is_none()
+    }
+
+    /// The upstream CA file, resolved against the configuration file's directory.
+    pub(super) fn upstream_ca_path(&self, config_path: &Path) -> Option<PathBuf> {
+        let path = self.upstream_ca_file.as_ref()?;
+        if path.is_absolute() {
+            return Some(path.clone());
+        }
+        Some(
+            config_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(path),
+        )
     }
 
     /// Refuse an `upgrade_http` entry that is not one host name.
@@ -85,6 +106,7 @@ mod tests {
     fn gateway(entries: &[&str]) -> Gateway {
         Gateway {
             upgrade_http: entries.iter().map(|entry| entry.to_string()).collect(),
+            upstream_ca_file: None,
         }
     }
 
