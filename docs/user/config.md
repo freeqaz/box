@@ -675,6 +675,13 @@ Create the path first, or name the existing directory above it. The same rule ho
 `strands-home`, the preload file, and the project all exist before the first `run`, because the
 tutorial's earlier steps made them.
 
+On Linux, a mount keeps the options it has in the surrounding OS. A grant can't make a file under a
+`noexec` mount runnable, or a file under a read-only mount writable. The sandbox start refuses such
+a grant with `'<path>' is on a mount with the '<option>' option, which a sandbox cannot remove, so
+an exec grant cannot apply to it` (excerpt). A mount below a granted directory keeps its own
+options. The agent runs the aliases in `box_dir`'s `bin`, so `box_dir` can't be on a `noexec`
+mount, such as `/run` on many Linux distributions.
+
 **A `write` grant alone is not runnable.** The agent's sandbox refuses to map code from a writable
 grant. When the agent's `command` or one of its interpreters lies inside a writable grant, the
 startup disclosure carries a warning:

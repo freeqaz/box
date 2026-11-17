@@ -859,6 +859,13 @@ impl MountView {
                     .file_type();
                 let device = std::os::unix::fs::FileTypeExt::is_char_device(&kind)
                     || std::os::unix::fs::FileTypeExt::is_block_device(&kind);
+                require_liftable_restrictions(
+                    &mounted,
+                    source,
+                    entry.writable,
+                    entry.executable,
+                    device && entry.writable && !entry.executable,
+                )?;
                 match (entry.writable, entry.executable) {
                     // An exec grant, its loader, or a library: read-only, and runnable.
                     (false, true) => remount_read_only(&mounted_path, mountpoint)?,
@@ -1133,22 +1140,26 @@ fn remount_recursive(
     })?;
 
     for line in table.lines() {
-        // Field 2 is the mount point, with octal escapes for space/tab/newline.
-        let Some(raw) = line.split_whitespace().nth(1) else {
+        // Field 2 is the mount point, with octal escapes for space/tab/newline; field 4 its options.
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let (Some(raw), Some(options)) = (fields.get(1), fields.get(3)) else {
             continue;
         };
         let point = PathBuf::from(unescape_mount_field(raw));
         if point != subtree && point.starts_with(subtree) {
-            points.push(point);
+            // A submount keeps the restrictions it already has: the user namespace locked them, so
+            // a remount that drops one fails with `EPERM`, and keeping one never widens the grant.
+            points.push((point, mount_restrictions(options)));
         }
     }
 
-    points.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    // The top mount is retained separately from the mutable scan prefix.
-    points.push(target.to_path_buf());
+    points.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+    // The top mount is retained separately from the mutable scan prefix. The caller has refused a
+    // grant that would need to lift one of its locked restrictions.
+    points.push((target.to_path_buf(), 0));
 
-    for point in points {
-        let outcome = mount_syscall(None, &point, None, flags, None);
+    for (point, kept) in points {
+        let outcome = mount_syscall(None, &point, None, flags | kept, None);
         // A *shadowed* submount cannot be remounted, and refusing on it would refuse a composition
         // that is already safe.
         if let Err(error) = outcome {
@@ -1164,6 +1175,56 @@ fn remount_recursive(
         }
     }
 
+    Ok(())
+}
+
+/// The restrictions a `/proc/self/mounts` options field names that a user namespace locks.
+fn mount_restrictions(options: &str) -> libc::c_ulong {
+    options
+        .split(',')
+        .map(|option| match option {
+            "ro" => libc::MS_RDONLY,
+            "nosuid" => libc::MS_NOSUID,
+            "nodev" => libc::MS_NODEV,
+            "noexec" => libc::MS_NOEXEC,
+            _ => 0,
+        })
+        .fold(0, |restrictions, restriction| restrictions | restriction)
+}
+
+/// Refuse a grant that needs its mount without a restriction the user namespace locked on it.
+fn require_liftable_restrictions(
+    mounted: &std::fs::File,
+    source: &Path,
+    writable: bool,
+    executable: bool,
+    device: bool,
+) -> Result<(), ContainmentError> {
+    let mut status = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: mounted owns the descriptor, and status supplies writable storage.
+    if unsafe { libc::fstatvfs(mounted.as_raw_fd(), status.as_mut_ptr()) } != 0 {
+        return Err(refusal(format!(
+            "reading the restrictions of the mount that holds '{}': {}",
+            source.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: fstatvfs initialized status on success.
+    let actual = unsafe { status.assume_init() }.f_flag;
+    for (needed, restriction, option, grant) in [
+        (executable, libc::ST_NOEXEC, "noexec", "an exec grant"),
+        (writable, libc::ST_RDONLY, "ro", "a write grant"),
+        (device, libc::ST_NODEV, "nodev", "a device write grant"),
+    ] {
+        if needed && actual & restriction != 0 {
+            return Err(refusal(format!(
+                "'{}' is on a mount with the '{option}' option, which a sandbox cannot remove, \
+                 so {grant} cannot apply to it; mount that filesystem without '{option}', \
+                 or move the path to a filesystem that has no '{option}' option",
+                source.display()
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -3326,6 +3387,162 @@ mod tests {
              41=the bind itself was writable, \
              42=THE SUBMOUNT WAS WRITABLE under a read-only grant, \
              43=a mount step errored)"
+        );
+    }
+
+    /// **A grant keeps the restrictions its mounts already have.** The kernel locks each `ro`,
+    /// `nosuid`, `nodev`, and `noexec` a mount had when a user namespace copied it, and a remount
+    /// that drops one fails with `EPERM`. A runnable grant over a tree with a `noexec` submount
+    /// keeps that submount `noexec`, and a runnable grant on the `noexec` mount itself is refused
+    /// by name, while a read grant on it is not.
+    #[test]
+    fn a_grant_keeps_the_restrictions_its_mounts_already_have() {
+        if !crate::backend::linux::namespace::probe::user_namespace_is_permitted() {
+            println!("skipping: this host forbids user namespaces");
+            return;
+        }
+        let directory = tempfile::tempdir().expect("tempdir");
+        let base = directory.path().join("base");
+        let view = directory.path().join("view");
+        let single = directory.path().join("single");
+        for path in [&base, &view, &single] {
+            std::fs::create_dir(path).expect("a fixture directory");
+        }
+
+        // SAFETY: the child enters new namespaces and exits; it never returns into
+        // test-harness code.
+        let child = unsafe { libc::fork() };
+        assert_ne!(child, -1, "fork failed");
+
+        if child == 0 {
+            let enter = |outer_uid: libc::uid_t, outer_gid: libc::gid_t| {
+                // SAFETY: irreversible for this single-threaded child only.
+                if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
+                    return false;
+                }
+                let _ = std::fs::write("/proc/self/setgroups", "deny");
+                std::fs::write("/proc/self/uid_map", format!("0 {outer_uid} 1")).is_ok()
+                    && std::fs::write("/proc/self/gid_map", format!("0 {outer_gid} 1")).is_ok()
+                    && mount_syscall(
+                        None,
+                        Path::new("/"),
+                        None,
+                        libc::MS_REC | libc::MS_PRIVATE,
+                        None,
+                    )
+                    .is_ok()
+            };
+            let flags = |path: &Path| {
+                let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+                let mut status = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+                // SAFETY: name is terminated, and status supplies writable storage.
+                if unsafe { libc::statvfs(name.as_ptr(), status.as_mut_ptr()) } != 0 {
+                    return None;
+                }
+                // SAFETY: statvfs initialized status on success.
+                Some(unsafe { status.assume_init() }.f_flag)
+            };
+            let pin = |path: &Path| {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+                    .open(path)
+            };
+
+            let outcome = (|| -> Result<u8, ContainmentError> {
+                // Read ids before the unshare: after it, `getuid()` is the overflow uid.
+                // SAFETY: reading this process's own ids.
+                let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+                if !enter(uid, gid) {
+                    return Ok(60);
+                }
+                // An exec-capable tree with a `noexec` submount, created here and so not locked.
+                mount_syscall(Some(Path::new("tmpfs")), &base, Some("tmpfs"), 0, None)
+                    .map_err(|e| refusal(format!("base: {e}")))?;
+                let sub = base.join("sub");
+                std::fs::create_dir(&sub).map_err(|e| refusal(format!("mkdir sub: {e}")))?;
+                mount_syscall(
+                    Some(Path::new("tmpfs")),
+                    &sub,
+                    Some("tmpfs"),
+                    libc::MS_NOEXEC,
+                    None,
+                )
+                .map_err(|e| refusal(format!("sub: {e}")))?;
+                // A nested user namespace copies both mounts and locks their restrictions, as the
+                // launcher's own user namespace does to every host mount.
+                if !enter(0, 0) {
+                    return Ok(61);
+                }
+
+                // A runnable grant over the tree: read-only and runnable, the submount `noexec`.
+                mount_syscall(Some(&base), &view, None, libc::MS_BIND | libc::MS_REC, None)
+                    .map_err(|e| refusal(format!("bind view: {e}")))?;
+                let mounted = pin(&view).map_err(|e| refusal(format!("pin view: {e}")))?;
+                if let Err(error) = remount_read_only(&targets::descriptor_path(&mounted), &view) {
+                    eprintln!("remount_read_only refused: {error}");
+                    return Ok(62);
+                }
+                let top = flags(&view).unwrap_or(0);
+                let submount = flags(&view.join("sub")).unwrap_or(0);
+                if submount & libc::ST_NOEXEC == 0 {
+                    return Ok(63);
+                }
+                if top & libc::ST_NOEXEC != 0 || top & libc::ST_RDONLY == 0 {
+                    return Ok(64);
+                }
+
+                // A grant on the `noexec` mount itself.
+                mount_syscall(
+                    Some(&sub),
+                    &single,
+                    None,
+                    libc::MS_BIND | libc::MS_REC,
+                    None,
+                )
+                .map_err(|e| refusal(format!("bind single: {e}")))?;
+                let mounted = pin(&single).map_err(|e| refusal(format!("pin single: {e}")))?;
+                let granted = Path::new("/granted/runtime");
+                match require_liftable_restrictions(&mounted, granted, false, true, false) {
+                    Err(error)
+                        if error.to_string().contains("'/granted/runtime'")
+                            && error.to_string().contains("'noexec'") => {}
+                    other => {
+                        eprintln!("an exec grant on a noexec mount: {other:?}");
+                        return Ok(65);
+                    }
+                }
+                if require_liftable_restrictions(&mounted, granted, false, false, false).is_err() {
+                    return Ok(66);
+                }
+                if remount_read_only_noexec(&targets::descriptor_path(&mounted), &single).is_err() {
+                    return Ok(67);
+                }
+                Ok(0)
+            })()
+            .unwrap_or_else(|error| {
+                eprintln!("a mount step failed: {error}");
+                68
+            });
+
+            // SAFETY: terminating the child with the verdict.
+            unsafe { libc::_exit(i32::from(outcome)) };
+        }
+
+        let mut status = 0;
+        // SAFETY: waiting on this process's own child.
+        unsafe { libc::waitpid(child, &mut status, 0) };
+        assert!(libc::WIFEXITED(status), "the child must exit normally");
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "60=no namespace, 61=no nested namespace, \
+             62=A LOCKED NOEXEC SUBMOUNT REFUSED THE GRANT, \
+             63=THE SUBMOUNT LOST NOEXEC, 64=the top lost exec or stayed writable, \
+             65=an exec grant on a noexec mount was not refused by name, \
+             66=a read grant on a noexec mount was refused, \
+             67=a read grant on a noexec mount failed to remount, 68=a mount step errored"
         );
     }
 

@@ -382,6 +382,18 @@ changing ordinary permissions, so those commands can fail even when they add no 
 existing special-bit files, refused requests that preserve the bits, and successful requests that
 clear them.
 
+### Linux mount options a grant keeps
+
+On Linux, Box builds a sandbox's view in its own user namespace. The kernel locks the `ro`,
+`nosuid`, `nodev`, and `noexec` options of each mount that the namespace copies from the
+surrounding OS, so a grant can add these options to its bind but can't remove one. A directory
+grant's submounts keep their own options: a `noexec` submount under an `exec` grant stays
+`noexec` in the sandbox. A grant that needs an option removed from its own mount, such as an `exec`
+grant on a file under a `noexec` mount, is refused when the sandbox starts, and the refusal names
+the path and the option. The aliases in the box directory's `bin` are `exec` grants, so the box
+directory can't be on a `noexec` mount. `a_grant_keeps_the_restrictions_its_mounts_already_have`
+checks both cases.
+
 ### What a process sees of other processes on macOS
 
 Every macOS sandbox hides other processes. The agent, each tool, and each local MCP server get the

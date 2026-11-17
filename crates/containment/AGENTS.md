@@ -1010,6 +1010,13 @@ changes, answer `sendfile` with `EINVAL` instead of permitting it, and accept th
   `/dev/urandom` and never from the pid.
 - **`remount_read_only` walks `/proc/self/mounts` and remounts deepest first**, because `MS_REMOUNT`
   ignores `MS_REC`. Unescape octal space, tab, newline, and backslash.
+- **A remount keeps each `ro`, `nosuid`, `nodev`, and `noexec` its mount already has.** The user
+  namespace locks them on every copied mount, and a remount that drops one fails with `EPERM`.
+  Measured on Ubuntu 24.04, where `/run` is `noexec`: a box whose `box_dir` was under `/run` failed
+  every start with `remounting '/proc/self/fd/N' read-only: Operation not permitted`, because the
+  aliases in `bin/` are exec grants. `remount_recursive` adds each submount's own options to its
+  flags, and `require_liftable_restrictions` refuses by name a grant that needs an option removed
+  from its own mount. `a_grant_keeps_the_restrictions_its_mounts_already_have` pins both.
 - Resolve `DT_NEEDED` through the image's `DT_RUNPATH` (or `DT_RPATH`) with `$ORIGIN` expanded,
   then the executable's, then a fixed per-architecture list, never `LD_LIBRARY_PATH`, never
   `/etc/ld.so.conf`, and never a hardware-capability subdirectory; refuse an unresolved name. The
