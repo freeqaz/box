@@ -944,6 +944,25 @@ and its `P_PIDFD` form takes a descriptor from the permitted `pidfd_open`.
 `a_child_is_awaited_with_waitid_under_the_filters` checks `P_ALL` with `WNOHANG`, `P_PIDFD`, and
 `P_PID` under the filters.
 
+### Signalling as an init
+
+A workload whose command starts under an init, such as `tini -s -- node ...`, exited at once on
+Linux x86-64 (Box main) and Linux ARM64 (Box 0.2.2). tini blocks the signals it forwards and waits
+for them with `rt_sigtimedwait`, which the permit filter refused:
+`[FATAL tini (2)] Unexpected error in sigtimedwait: 'Operation not permitted'`. It forwards each
+signal to its child with `kill`, which the filter also refused. With both permitted, the same box
+started the same command and the workload ran. Neither call adds reach:
+
+| Call | Reach | Existing permitted counterpart |
+| --- | --- | --- |
+| `rt_sigtimedwait` | Takes a signal already pending for the calling thread. | `rt_sigprocmask` and `rt_sigaction` |
+| `kill` | Signals a process, its process group (`-pgid`), the caller's group (`0`), or every process the caller may signal (`-1`). Each form resolves PIDs in the caller's PID namespace and its descendants. | `tgkill(pid, pid, sig)` reaches the same processes one at a time |
+
+`an_init_waits_for_and_forwards_signals_under_the_filters` runs tini's loop under the filters.
+`a_workload_signals_nothing_outside_its_pid_namespace` checks that a host process of the same user,
+which the same process signals before containment, is absent by PID and by process group from inside,
+and survives a `SIGKILL` aimed at both.
+
 ### W^X
 
 W^X closes three routes. Every writable mount, including `/tmp`, uses `MS_NOEXEC`. The permit filter

@@ -1843,6 +1843,66 @@ mod tests {
         );
     }
 
+    /// An init's signal loop passes both filters: it blocks a signal, waits for it with
+    /// `rt_sigtimedwait`, and forwards a signal to its child with `kill`.
+    #[test]
+    fn an_init_waits_for_and_forwards_signals_under_the_filters() {
+        let filters = syscall::SyscallPolicy::for_config(&Network::Blocked)
+            .compile()
+            .expect("the filters compile");
+        let outcome = in_filtered_child(&filters, || unsafe {
+            let mut blocked: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&raw mut blocked);
+            libc::sigaddset(&raw mut blocked, libc::SIGUSR1);
+            if libc::sigprocmask(libc::SIG_BLOCK, &raw const blocked, std::ptr::null_mut()) != 0 {
+                return 10;
+            }
+            if libc::kill(libc::getpid(), libc::SIGUSR1) != 0 {
+                return 11;
+            }
+            let timeout = libc::timespec {
+                tv_sec: 5,
+                tv_nsec: 0,
+            };
+            let waited = libc::syscall(
+                libc::SYS_rt_sigtimedwait,
+                &raw const blocked,
+                std::ptr::null_mut::<libc::siginfo_t>(),
+                &raw const timeout,
+                std::mem::size_of::<libc::c_ulong>(),
+            );
+            if waited != libc::c_long::from(libc::SIGUSR1) {
+                return 12;
+            }
+            let child = libc::fork();
+            if child == -1 {
+                return 13;
+            }
+            if child == 0 {
+                loop {
+                    libc::pause();
+                }
+            }
+            if libc::kill(child, libc::SIGTERM) != 0 {
+                return 14;
+            }
+            let mut status = 0;
+            if libc::waitpid(child, &raw mut status, 0) != child
+                || !libc::WIFSIGNALED(status)
+                || libc::WTERMSIG(status) != libc::SIGTERM
+            {
+                return 15;
+            }
+            0
+        });
+        assert_eq!(
+            outcome, 0,
+            "10 = sigprocmask refused, 11 = kill of self refused, 12 = rt_sigtimedwait did not \
+             return the pending signal, 13 = fork failed, 14 = kill of the child refused, \
+             15 = the child did not die by the forwarded signal"
+        );
+    }
+
     #[test]
     fn resource_usage_of_self_and_children_passes_both_filters() {
         let filters = syscall::SyscallPolicy::for_config(&Network::Blocked)
@@ -2541,6 +2601,133 @@ mod tests {
              24=capabilities survived, 25=host processes visible, \
              26=approved credential form failed, 27=unapproved credential form passed, \
              28=nested namespace creation failed)"
+        );
+    }
+
+    /// **A workload signals nothing outside its PID namespace.** `kill` and `tgkill` are
+    /// permitted, so the namespace is the bound: a host process of the same user, which the same
+    /// process signals before containment, is absent by its PID and by its process group, and it
+    /// survives a `SIGKILL` aimed at both.
+    #[test]
+    fn a_workload_signals_nothing_outside_its_pid_namespace() {
+        if !the_host_can_build_a_view() {
+            println!("skipping: this host cannot build a namespace mount view");
+            return;
+        }
+
+        // A host process of the same user, in its own process group, so a group signal that
+        // escaped could reach nothing else.
+        // SAFETY: the child sets its process group and waits to be killed; it never returns into
+        // test-harness code.
+        let sentinel = unsafe { libc::fork() };
+        assert_ne!(sentinel, -1, "fork failed");
+        if sentinel == 0 {
+            // SAFETY: the sentinel changes only its own process group, then waits.
+            unsafe {
+                libc::setpgid(0, 0);
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        // Both orders of the race leave the sentinel in its own group.
+        // SAFETY: the parent sets the process group of its own child.
+        unsafe { libc::setpgid(sentinel, sentinel) };
+        // A PID the fresh namespace also uses would name a process inside it, not the sentinel.
+        if usize::try_from(sentinel).is_ok_and(|pid| pid <= MAX_VISIBLE_PIDS_IN_FRESH_NAMESPACE) {
+            // SAFETY: stopping and reaping this process's own child.
+            unsafe {
+                libc::kill(sentinel, libc::SIGKILL);
+                libc::waitpid(sentinel, std::ptr::null_mut(), 0);
+            }
+            println!("skipping: the sentinel's PID is one a fresh namespace can use");
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = ContainmentConfig::new()
+            .allow(directory.path(), Operation::Read, Scope::Root)
+            .expect("grant a directory");
+
+        // SAFETY: the child applies containment and exits; it never returns into
+        // test-harness code.
+        let child = unsafe { libc::fork() };
+        assert_ne!(child, -1, "fork failed");
+
+        if child == 0 {
+            let refused = |result: libc::c_int| {
+                result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            };
+            // The control: before containment, this process can signal the sentinel, so a
+            // refusal below comes from the namespace and not from the kernel's permission check.
+            // SAFETY: signal 0 delivers nothing; it only checks that the target can be signalled.
+            if unsafe { libc::kill(sentinel, 0) } != 0 {
+                // SAFETY: terminating the child.
+                unsafe { libc::_exit(30) };
+            }
+            let backend = NamespaceBackend::with_probe_result(true);
+            if let Err(error) = backend.apply(&config, None, None, None) {
+                eprintln!("apply failed: {error}");
+                // SAFETY: terminating the child.
+                unsafe { libc::_exit(31) };
+            }
+
+            // Only the workload process reaches here, already contained.
+            // SAFETY: each call names the sentinel, its group, or this process. A host process
+            // that the namespace failed to hide is the sentinel, which the parent kills anyway.
+            let code = unsafe {
+                if libc::kill(libc::getpid(), 0) != 0 {
+                    32 // kill must pass the filter
+                } else if !refused(libc::kill(sentinel, 0)) {
+                    33 // the host PID must be absent
+                } else if !refused(libc::kill(-sentinel, 0)) {
+                    34 // the host process group must be absent
+                } else if !refused(libc::kill(sentinel, libc::SIGKILL))
+                    || !refused(libc::kill(-sentinel, libc::SIGKILL))
+                {
+                    35 // a fatal signal must reach nothing
+                } else if libc::syscall(
+                    libc::SYS_tgkill,
+                    libc::c_long::from(sentinel),
+                    libc::c_long::from(sentinel),
+                    libc::c_long::from(libc::SIGKILL),
+                ) != -1
+                    || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+                {
+                    36 // nor its thread-directed form
+                } else {
+                    0
+                }
+            };
+
+            // SAFETY: terminating the workload with the verdict.
+            unsafe { libc::_exit(code) };
+        }
+
+        let mut status = 0;
+        // SAFETY: waiting on this process's own child.
+        unsafe { libc::waitpid(child, &mut status, 0) };
+        let mut sentinel_status = 0;
+        // SAFETY: polling this process's own child without blocking.
+        let sentinel_exited =
+            unsafe { libc::waitpid(sentinel, &mut sentinel_status, libc::WNOHANG) } != 0;
+        // SAFETY: stopping and reaping this process's own child.
+        unsafe {
+            libc::kill(sentinel, libc::SIGKILL);
+            libc::waitpid(sentinel, &mut sentinel_status, 0);
+        }
+        assert!(libc::WIFEXITED(status), "the child must exit normally");
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "a workload reached a host process (30=the uncontained control could not signal \
+             the sentinel, 31=apply failed, 32=kill of self refused, 33=HOST PID VISIBLE, \
+             34=HOST PROCESS GROUP VISIBLE, 35=A FATAL SIGNAL FOUND A HOST TARGET, \
+             36=TGKILL FOUND A HOST THREAD)"
+        );
+        assert!(
+            !sentinel_exited,
+            "the host sentinel must survive the workload"
         );
     }
 
