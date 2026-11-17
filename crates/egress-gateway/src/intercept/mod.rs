@@ -4,4 +4,6 @@
 pub(crate) mod mitm;
 
 #[cfg(feature = "tls-intercept")]
-pub use mitm::{BackendDial, MitmConfig, MitmHandle, MitmInterceptor, ResponseLimits};
+pub use mitm::{
+    BackendDial, CredentialSource, MitmConfig, MitmHandle, MitmInterceptor, ResponseLimits,
+};

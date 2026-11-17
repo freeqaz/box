@@ -81,6 +81,33 @@ impl CapabilitySet {
         Ok(())
     }
 
+    /// The edits that attach `value`, the credential a request-time source released for one request
+    /// to `target`, and the scrubber for that exchange's response. Exactly one capability must govern
+    /// a request-time credential there, or the request must not go out.
+    #[cfg(feature = "tls-intercept")]
+    pub(crate) fn released_edits(
+        &self,
+        target: &Target,
+        value: zeroize::Zeroizing<String>,
+    ) -> std::result::Result<(Vec<Mutation>, credentials::ResponseRedactor), String> {
+        let mut governing = self
+            .matching(&target.as_destination())
+            .into_iter()
+            .filter_map(|credential| credential.released_edits(target, value.clone()));
+        match (governing.next(), governing.next()) {
+            (Some(edits), None) => edits,
+            (None, _) => Err(format!(
+                "no request-time credential binding governs {}:{}",
+                target.host, target.port
+            )),
+            (Some(_), Some(_)) => Err(format!(
+                "two request-time credential bindings govern {}:{}; a destination is one \
+                 credential authority",
+                target.host, target.port
+            )),
+        }
+    }
+
     /// Sign a re-routed request for its backend, AFTER the gateway has rewritten the `Host` to the
     /// backend and built the forwarded target. Finds the capability governing `original` (the backend
     /// vault, registered under the original destination) and applies the SigV4 edits its signed route
@@ -360,6 +387,7 @@ mod tests {
             headers,
             body: Vec::new(),
             advisory_note: None,
+            credential_source: None,
         }
     }
 

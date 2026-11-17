@@ -9,6 +9,7 @@ pub(crate) mod http1;
 pub(crate) mod l7;
 pub(crate) mod listener;
 mod resolve;
+pub(crate) mod source;
 pub(crate) mod tls;
 
 use std::net::SocketAddr;
@@ -27,6 +28,7 @@ use crate::error::{ProxyError, Result};
 use crate::seams::Emitter;
 
 pub use handle::MitmHandle;
+pub use source::CredentialSource;
 
 /// Size limits for captured requests and MCP catalog responses.
 #[derive(Debug, Clone)]
@@ -99,6 +101,11 @@ pub struct MitmConfig {
     /// Matched as a whole host, without regard to case or a trailing dot. Empty means no upgrade, and
     /// every existing caller keeps today's behavior unchanged.
     pub upgrade_http: Vec<String>,
+    /// The request-time credential sources a route's credential may come from, by name. The gateway
+    /// asks the source a request's route names for that request's credential after policy permits
+    /// the request, and refuses a workload request to a source's own `https` authority. Empty means no
+    /// request-time source, and every existing caller keeps today's behavior unchanged.
+    pub credential_sources: Vec<CredentialSource>,
 }
 
 /// Where a re-routed destination dials, and how the upstream leg speaks to it.
@@ -143,6 +150,7 @@ impl Default for MitmConfig {
             mcp_servers: Vec::new(),
             backends: Vec::new(),
             upgrade_http: Vec::new(),
+            credential_sources: Vec::new(),
         }
     }
 }
@@ -163,6 +171,8 @@ pub(crate) struct SharedState {
     effect_interceptor: Arc<dyn EffectInterceptor>,
     /// The bytes every reply observer's copy may hold at once.
     pub(crate) reply_copies: Arc<body::CopyBudget>,
+    /// The request-time credential sources, each with the TLS configuration its endpoint needs.
+    pub(crate) credential_sources: Vec<source::SourceClient>,
 }
 
 impl SharedState {
@@ -213,6 +223,21 @@ impl SharedState {
             .find(|(configured, _)| connect::same_host(configured, host))
             .map(|(_, name)| name.as_str())
     }
+
+    /// The request-time credential source named `name`.
+    fn credential_source(&self, name: &str) -> Option<&source::SourceClient> {
+        self.credential_sources
+            .iter()
+            .find(|client| client.name() == name)
+    }
+
+    /// Whether `host:port` is a credential source's own `https` authority, which no workload request
+    /// may reach.
+    fn is_credential_source(&self, host: &str, port: u16) -> bool {
+        self.credential_sources
+            .iter()
+            .any(|client| client.source().listens_on(host, port))
+    }
 }
 
 /// The emitter [`MitmInterceptor::start`] installs: it drops each record, so nothing grows unread.
@@ -259,6 +284,21 @@ impl MitmInterceptor {
         // (a deployment's private CA / corporate root).
         let upstream_config = Arc::new(tls::upstream_client_config(&config.upstream_ca_pems)?);
 
+        // Each credential source's own trust, built now so an unusable CA refuses the start.
+        let mut credential_sources = Vec::with_capacity(config.credential_sources.len());
+        for declared in &config.credential_sources {
+            if credential_sources
+                .iter()
+                .any(|client: &source::SourceClient| client.name() == declared.name())
+            {
+                return Err(ProxyError::Config(format!(
+                    "two credential sources are named {:?}",
+                    declared.name()
+                )));
+            }
+            credential_sources.push(source::SourceClient::new(declared.clone())?);
+        }
+
         let state = Arc::new(SharedState {
             controls,
             config: config.clone(),
@@ -269,6 +309,7 @@ impl MitmInterceptor {
             reply_copies: Arc::new(body::CopyBudget::for_limit(
                 config.response_limits.max_body_bytes,
             )),
+            credential_sources,
         });
 
         let stop = Arc::new(AtomicBool::new(false));
