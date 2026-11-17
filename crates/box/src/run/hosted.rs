@@ -446,6 +446,7 @@ fn tool_spawner(
             let captured = crate::run::contain::supervise::LeafBox::run(
                 boundary,
                 &layout,
+                spawn.stdin,
                 #[cfg(any(
                     all(target_os = "macos", feature = "native-filesystem-policy"),
                     all(
@@ -3143,6 +3144,7 @@ while :; do :; done"#
                     invoked: PathBuf::from("/bin/sh"),
                     args,
                     cwd: checked,
+                    stdin: None,
                 }))
                 .err()
                 .expect("the changed directory must refuse the launch");

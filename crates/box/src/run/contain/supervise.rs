@@ -911,6 +911,7 @@ impl LeafBox {
     pub(crate) async fn run(
         boundary: Boundary,
         layout: &BoxRoot,
+        stdin: Option<tokio::io::DuplexStream>,
         #[cfg(any(
             all(target_os = "macos", feature = "native-filesystem-policy"),
             all(
@@ -922,7 +923,9 @@ impl LeafBox {
         registration: Option<crate::run::native_enforcement::Registration>,
     ) -> Result<CapturedLeaf, BoxError> {
         // Captured, so the bytes come back to the Shell and leave through its own streams. stdin is
-        // null: a leaf binary reads no stdin, and one that blocked would hold the Call to its deadline.
+        // the Shell command's own input when the caller hands one over (a pipe the binary reads
+        // like any other, so a binary that never reads it is not held), and null otherwise.
+        let piped_stdin = stdin.is_some();
         let LaunchedLeaf {
             mut group,
             mut trampoline,
@@ -931,7 +934,11 @@ impl LeafBox {
         } = Self::launch_contained(
             &boundary,
             layout,
-            Stdio::null(),
+            if piped_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            },
             Stdio::piped(),
             Stdio::piped(),
             #[cfg(any(
@@ -946,9 +953,23 @@ impl LeafBox {
         )
         .await?;
 
+        // The pump ends at the input's end (closing the binary's stdin) or when the binary closes
+        // its end; it never outlives the binary.
+        let pump = match (stdin, group.child_mut().stdin.take()) {
+            (Some(mut input), Some(mut child_stdin)) => Some(tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt as _;
+                let _ = tokio::io::copy(&mut input, &mut child_stdin).await;
+                let _ = child_stdin.shutdown().await;
+            })),
+            _ => None,
+        };
+
         // The boundary keeps all launch inputs alive until the child exits.
         trampoline.close_setup_writer();
         let output = group.wait_with_output().await;
+        if let Some(pump) = pump {
+            pump.abort();
+        }
         let termination_result = group.release().await;
         let setup_result = trampoline.setup_failure();
 

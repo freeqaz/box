@@ -20,6 +20,9 @@ const DENIED_STATUS: i32 = 126;
 /// The status of a decision that faulted, or of an outcome that could not be recorded.
 const FAULT_STATUS: i32 = 125;
 
+/// The buffer between a command's stdin and a spawned program; a full buffer holds the writer.
+const LEAF_STDIN_BUFFER: usize = 64 * 1024;
+
 /// What one Python source printed and returned.
 pub struct ScriptOutcome {
     /// The script's exit status.
@@ -294,14 +297,44 @@ impl CommandFallback for ShellKernel {
             permit.finish(context, 127).await;
             return Ok(None);
         }
-        let spawn = HostSpawn {
-            program: resolved.path.into(),
-            invoked: resolved.spelling.into(),
-            args,
-            cwd: working_directory,
-        };
         let spawned = match &self.commands.spawner {
-            Some(spawner) => spawner(spawn).await,
+            Some(spawner) => {
+                // The program reads the command's stdin as a pipe, filled while it runs: a hook
+                // or filter gets what the caller piped to it, and a program that never reads it is
+                // not held (the pump stops when the program ends).
+                let (reader, writer) = match context.stdio() {
+                    (Some(_), _, _) => {
+                        let (reader, writer) = tokio::io::duplex(LEAF_STDIN_BUFFER);
+                        (Some(reader), Some(writer))
+                    }
+                    _ => (None, None),
+                };
+                let spawn = HostSpawn {
+                    program: resolved.path.into(),
+                    invoked: resolved.spelling.into(),
+                    args,
+                    cwd: working_directory,
+                    stdin: reader,
+                };
+                let run = spawner(spawn);
+                let input = context.stdio().0;
+                let pump = async move {
+                    if let (Some(input), Some(mut writer)) = (input, writer) {
+                        let _ = tokio::io::copy(input, &mut writer).await;
+                        let _ = writer.shutdown().await;
+                    }
+                };
+                let mut run = std::pin::pin!(run);
+                let mut pump = std::pin::pin!(pump);
+                let mut pumping = true;
+                std::future::poll_fn(|cx| {
+                    if pumping && pump.as_mut().poll(cx).is_ready() {
+                        pumping = false;
+                    }
+                    run.as_mut().poll(cx)
+                })
+                .await
+            }
             None => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "host-binary execution requires a contained spawner; none is installed",
