@@ -11,12 +11,12 @@ use crate::audit::RequestId;
 
 use super::body::ResponseBody;
 use super::connect::{ConnectRequest, parse_authority, same_host};
-use super::{BackendDial, SharedState, http1};
+use super::{BackendDial, SharedState, http1, source};
 use crate::audit::Decision as AuditDecision;
 use crate::audit::EgressDecision;
 use crate::boundary::{HeaderMap, InterceptedRequest, Target};
 use crate::client::http::{ResponseCompletion, ResponseProgress, Upstream};
-use crate::effect::{ClaimedEffectPermit, EffectAttempt, McpFrame, McpListReply};
+use crate::effect::{ClaimedEffectPermit, EffectAttempt, EffectOutcome, McpFrame, McpListReply};
 use crate::error::{ProxyError, Result};
 use crate::mcp::{
     McpTarget, McpTargetIdentity, canonicalize_mcp_frame, mcp_denial_response, normalize_path,
@@ -303,7 +303,7 @@ async fn run_l7_legs(
             }
         }
     }
-    let prepared_request =
+    let mut prepared_request =
         http1::write_request(&method, &fwd_target, &req.headers, forwarded_body.len())?;
     let request_attempt = EffectAttempt::HttpRequest {
         host: &connect.host,
@@ -345,6 +345,79 @@ async fn run_l7_legs(
             ));
         }
     };
+    // A request-time route's credential is asked for only now: policy has permitted this request,
+    // and nothing has gone upstream. The source releases the credential for this one request or
+    // withholds it; every failure withholds it, and a withheld request does not leave. The released
+    // value attaches at the route's own placement, so the policy decision above judged every input
+    // the request still carries.
+    let mut exchange_redactor = None;
+    if let Some(name) = req.credential_source.take() {
+        let released = match state.credential_source(&name) {
+            None => Err(source::Withheld {
+                reason: format!("no credential source is named {name:?}"),
+                code: None,
+            }),
+            Some(_) if backend.is_some() => Err(source::Withheld {
+                reason: "a re-routed destination takes no request-time credential".to_string(),
+                code: None,
+            }),
+            Some(client) => {
+                let ask = source::Ask {
+                    host: &connect.host,
+                    port: connect.port,
+                    method: &method,
+                    path: &workload_path,
+                    query: &req.target.query,
+                    headers: &req.headers,
+                    body: &forwarded_body,
+                };
+                client.release(&ask).await
+            }
+        };
+        let edits = released.and_then(|released| {
+            let send_by = released.send_by;
+            state
+                .controls
+                .released_edits(&target, released.value)
+                .map(|(mutations, redactor)| (mutations, redactor, send_by))
+                .map_err(|reason| source::Withheld { reason, code: None })
+        });
+        let edits = edits.and_then(|edits| {
+            // The source's deadline is checked last, immediately before the request is serialized.
+            if std::time::SystemTime::now() < edits.2 {
+                Ok(edits)
+            } else {
+                Err(source::Withheld {
+                    reason: format!("the credential source {name:?} released a credential whose deadline passed before it was sent"),
+                    code: None,
+                })
+            }
+        });
+        match edits {
+            Ok((mutations, redactor, _)) => {
+                for mutation in mutations {
+                    mutation.apply(&mut req.headers, &mut req.target);
+                }
+                exchange_redactor = Some(redactor);
+                prepared_request =
+                    http1::write_request(&method, &fwd_target, &req.headers, forwarded_body.len())?;
+            }
+            Err(withheld) => {
+                request_permit
+                    .record_outcome(EffectOutcome::Failed {
+                        accepted_bytes: 0,
+                        error_kind: io::ErrorKind::PermissionDenied,
+                    })
+                    .map_err(|error| {
+                        ProxyError::Io(format!("recording a withheld request outcome: {error}"))
+                    })?;
+                return Ok(refuse(
+                    &withheld.reason,
+                    WorkloadResponse::refusal(403, &withheld.workload_body()),
+                ));
+            }
+        }
+    }
     let request = (method.as_str(), workload_path.as_str());
     emit_decision(
         state,
@@ -399,7 +472,7 @@ async fn run_l7_legs(
     // line as the reason.
     head.headers.remove(crate::PROXY_ORIGIN_HEADER);
 
-    let controls = match state.controls.response_controls(&mut head.headers, &target) {
+    let mut controls = match state.controls.response_controls(&mut head.headers, &target) {
         Ok(controls) => controls,
         Err(_) => {
             return Ok(WorkloadResponse::refusal(
@@ -408,6 +481,29 @@ async fn run_l7_legs(
             ));
         }
     };
+    // A released credential is scrubbed from this exchange's response, headers and body, as a
+    // resolved secret is from every response to its destination.
+    if let Some(redactor) = exchange_redactor {
+        if head
+            .headers
+            .iter()
+            .any(|(_, value)| redactor.redact_header(value).is_some())
+        {
+            head.headers = HeaderMap::from_pairs(
+                head.headers
+                    .iter()
+                    .map(|(name, value)| {
+                        let value = redactor
+                            .redact_header(value)
+                            .unwrap_or_else(|| value.to_string());
+                        (name.to_string(), value)
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        controls.redactors.push(redactor);
+    }
+
     if controls.requires_empty_body {
         while let Some(frame) = body.frame().await {
             let frame = frame.map_err(|error| ProxyError::Io(format!("upstream body: {error}")))?;
@@ -573,6 +669,7 @@ fn intercepted_request(
         headers: parsed.headers,
         body: parsed.body,
         advisory_note: None,
+        credential_source: None,
     }
 }
 

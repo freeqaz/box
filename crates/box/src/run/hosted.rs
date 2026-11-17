@@ -784,6 +784,7 @@ impl HostedBox {
         collector: Arc<telemetry::Collector>,
         protected_sources: &[AuthoritySource],
         upstream_ca_pems: &[String],
+        credential_sources: Vec<egress_gateway::CredentialSource>,
         owned: Lock,
         workspace: &Path,
         home: &Path,
@@ -899,6 +900,8 @@ impl HostedBox {
                 // The hosts whose plain HTTP on port 80 is decided and sent as HTTPS on 443.
                 upgrade_http: record.gateway.upgrade_http.clone(),
                 upstream_ca_pems: upstream_ca_pems.to_vec(),
+                // The endpoints `source://` routes ask, after policy permits each request.
+                credential_sources,
                 ..MitmConfig::default()
             },
             capabilities,
@@ -2028,6 +2031,7 @@ permit (principal, action == alpha::Action::"read", resource);"#
             Arc::clone(&collector),
             &[],
             &[],
+            Vec::new(),
             owned,
             &workspace,
             &workspace,
@@ -2103,6 +2107,7 @@ permit (principal, action == alpha::Action::"read", resource);"#
                 collector,
                 &[],
                 &[],
+                Vec::new(),
                 owned,
                 &workspace,
                 &workspace,

@@ -42,8 +42,10 @@ An HTTP MCP server, `[mcp.<name>] type = "http"`, takes the same `secret` keys. 
 the same route, and everything on this page applies to it as described in [the `[mcp.<name>]`
 table](../user/mcp.md).
 
-Box accepts only the `env://` and `aws://` schemes. A route that names any other scheme is refused
-when the configuration loads. See [a credential the box can't deliver is refused at
+Box accepts only the `env://`, `aws://`, `credsd://`, and `source://` schemes. A route that names
+any other scheme is refused when the configuration loads. A `source://` route gets its value for
+each request from a [request-time source](../user/egress.md#request-time-sources).
+ See [a credential the box can't deliver is refused at
 load](./decisions.md#an-undeliverable-credential-is-refused-at-load).
 
 ## The parts

@@ -11,16 +11,18 @@ not rename during the freeze.
 
 ## Public Contract
 
-The façade exports 37 names (`src/lib.rs`): 31 unconditional, and 6 behind the default-on
-`tls-intercept` feature — `BackendDial`, `MitmConfig`, `MitmHandle`, `MitmInterceptor`,
-`ResponseLimits`, `upstream_ca_certificates` — which stay behind it. `BackendDial` is a
-`MitmConfig.backends` entry, consumed by `strands-box`'s `run/hosted.rs`. `ReplyObserver` is
+The façade exports 38 names (`src/lib.rs`): 31 unconditional, and 7 behind the default-on
+`tls-intercept` feature — `BackendDial`, `CredentialSource`, `MitmConfig`, `MitmHandle`,
+`MitmInterceptor`, `ResponseLimits`, `upstream_ca_certificates` — which stay behind it.
+`BackendDial` is a `MitmConfig.backends` entry, consumed by `strands-box`'s `run/hosted.rs`.
+`CredentialSource` is a `MitmConfig.credential_sources` entry, consumed by `strands-box`'s
+`run/credential.rs`, and its `check` is consumed by the box's config loader. `ReplyObserver` is
 exported for `policy`'s egress adapter, which records how an HTTP MCP tool call ended.
 `audit::Decision` exits as `AuditDecision`. `normalize_host` and `is_bindable_host` are the one host
 spelling, exported for `policy::spelling`, which refuses a host literal no bound host can equal.
 `upstream_ca_certificates` is the gateway's own reading of an operator CA bundle, exported for
 `strands-box`'s `record/config`, which refuses a `[gateway] upstream_ca_file` the gateway could not
-use before the workload starts. A 38th name needs a named external caller.
+use before the workload starts. A 39th name needs a named external caller.
 
 - Keep implementation modules private, re-export the supported surface from `src/lib.rs`, and keep
   `#![warn(missing_docs, unreachable_pub)]` enabled.
@@ -74,6 +76,10 @@ The gateway holds no destination deny list. A metadata or link-local address is 
   [no connection is opaque](../../docs/design/decisions.md#no-connection-is-opaque-to-the-boundary).
   Do not re-add a visibility gate.
 - The dependency direction stays `egress-gateway -> credentials`.
+- Ask a request-time credential source (`intercept/mitm/source.rs`) only after `claim_effect`
+  admits the `HttpRequest` attempt, and treat its reply as edits or a refusal, never an allow.
+  Every source failure records `EffectOutcome::Failed` on the request permit and refuses the
+  request with 403 before any upstream byte. No retry, and no value outlives its exchange.
 
 ## Internal Ownership
 
@@ -87,7 +93,7 @@ The capability modules carry no authority.
 
 Three divergences from `docs/conventions.md` are live, and none is license to rename:
 
-- No root noun: 37 exports, no single type reached by one verb, `Interceptor` a one-method port, and
+- No root noun: 38 exports, no single type reached by one verb, `Interceptor` a one-method port, and
   `MitmInterceptor::start` taking three arguments and returning `MitmHandle`.
 - A bare `Emitter` export; `credentials` demoted its same-named trait to `pub(crate)`.
 - `Mitm*` states the mechanism, and `ProxyError`'s "proxy" strings diverge from the crate name.
@@ -167,6 +173,12 @@ Conventions: `docs/conventions.md`.
   loopback showed no difference. The call is best-effort, and the AF_UNIX transport has no such
   option. The upstream socket also passes through `into_async`, so it gets a second call that
   changes nothing.
+- A request-time source's released value and bearer token are wrapped in `Zeroizing` in our code,
+  but hyper's reply buffers, `serde_json`'s parsed `String`, and the `HeaderValue` written on the
+  request are freed without wiping. The `send_by_unix_ms` check reads the host clock once the value
+  attaches, before the upstream connection opens, so a slow upload can still arrive after it. The
+  floor that refuses a workload `CONNECT` to an `https` source compares the CONNECT name with the
+  source host (`connect::same_host`); another name for the same address passes it.
 
 ## Change Checklist
 

@@ -264,7 +264,9 @@ Each looks like a simplification and is not. If one is genuinely wanted, record 
   workload input, and each process discloses it. `[gateway] upgrade_http` adds no grant either:
   policy decides each upgraded request on port 443, as it decides a `CONNECT` to that host.
   `[gateway] upstream_ca_file` adds no grant: it names CA certificates the gateway also trusts when
-  it verifies an upstream server, read as an authority source, and policy still decides each request. `[agent]` and each
+  it verifies an upstream server, read as an authority source, and policy still decides each request.
+  `[gateway.credential_source.<name>]` adds no grant: the gateway asks it for a request's credential
+  only after policy permits the request, and it can only give a value or refuse. `[agent]` and each
   `[tool.<label>]` hold one `ProcessSpec`, which is six fields — `command`, `workspace`, `env`,
   `filesystem`, `native-filesystem-policy`, and `grammar`. Only a `[tool.<label>]` takes
   `grammar`, behind `[experimental-features] tool-grammars`, and `[agent]` refuses it. `filesystem` holds the path lists: eight for `[agent]`, six

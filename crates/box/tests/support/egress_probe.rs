@@ -21,6 +21,7 @@
 //! handshake, which is also what proves the box's CA reaches the workload.
 //!
 //! Usage: `box-egress-probe <url> <phantom-env-var> [-- <command> <args…>]`, or
+//! `box-egress-probe connect-unix <path>`, or
 //! `box-egress-probe protect-authority <config> <policy> <replacement> <alias>`, or
 //! `box-egress-probe move-authority-parent <source> <destination> <relative-authority>`, or
 //! `box-egress-probe broker-move-authority-parent <alias> <source> <destination> <moved-config>`.
@@ -47,6 +48,10 @@ fn main() {
     let mut arguments: Vec<String> = env::args().skip(1).collect();
     if arguments.first().map(String::as_str) == Some("trace-requests") {
         trace_requests(&arguments[1..]);
+        return;
+    }
+    if arguments.first().map(String::as_str) == Some("connect-unix") {
+        connect_unix(&arguments[1..]);
         return;
     }
     if arguments.first().map(String::as_str) == Some("http-response") {
@@ -135,6 +140,23 @@ fn main() {
     }
 }
 
+/// Try to connect to the Unix socket at `path`, and print `unix=connected` or `unix=refused`.
+#[cfg(unix)]
+fn connect_unix(arguments: &[String]) {
+    let [path] = arguments else {
+        fail("usage: box-egress-probe connect-unix <path>");
+    };
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => println!("unix=connected"),
+        Err(error) => println!("unix=refused: {error}"),
+    }
+}
+
+#[cfg(not(unix))]
+fn connect_unix(_: &[String]) {
+    fail("connect-unix needs a Unix platform");
+}
+
 fn http_response(arguments: &[String]) {
     let [authority, body] = arguments else {
         fail("usage: box-egress-probe http-response <authority> <body>");
@@ -166,6 +188,11 @@ struct TraceRequest {
     url: String,
     #[serde(default)]
     headers: std::collections::BTreeMap<String, String>,
+    /// Headers whose value is a literal prefix and the value of a workload variable, as
+    /// `{"authorization": ["Bearer ", "PHANTOM_VARIABLE"]}`, so a request can carry a phantom
+    /// without a shell between the box and the probe.
+    #[serde(default)]
+    env_headers: std::collections::BTreeMap<String, [String; 2]>,
     body: Option<serde_json::Value>,
 }
 
@@ -249,6 +276,11 @@ fn trace_exchange(
     )?;
     for (name, value) in &request.headers {
         write!(stream, "{name}: {value}\r\n")?;
+    }
+    for (name, [prefix, variable]) in &request.env_headers {
+        let value = env::var(variable)
+            .map_err(|_| std::io::Error::other(format!("{variable} is not set")))?;
+        write!(stream, "{name}: {prefix}{value}\r\n")?;
     }
     write!(stream, "\r\n{body}")?;
     stream.flush()?;

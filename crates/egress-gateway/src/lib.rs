@@ -35,5 +35,6 @@ pub use seams::{Emitter, StubEmitter};
 
 #[cfg(feature = "tls-intercept")]
 pub use intercept::{
-    BackendDial, MitmConfig, MitmHandle, MitmInterceptor, ResponseLimits, upstream_ca_certificates,
+    BackendDial, CredentialSource, MitmConfig, MitmHandle, MitmInterceptor, ResponseLimits,
+    upstream_ca_certificates,
 };

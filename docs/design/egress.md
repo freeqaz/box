@@ -258,6 +258,7 @@ forward each request. The route specifies which credential to add and grants no 
 | An environment variable | `env://NAME` | Reads `NAME` from the environment of `box run` once, at startup, and swaps it in for a placeholder |
 | An AWS profile | `aws://PROFILE` | Signs each request with SigV4, resolving the named profile through the AWS SDK |
 | The AWS default chain | `aws://` (no profile) | Signs each request with SigV4, from the AWS SDK default credential provider chain (the host's ambient identity), and warns on every signed request |
+| A request-time source | `source://NAME` | Swaps a placeholder from `secret.env`. After policy permits the request, asks `[gateway.credential_source.NAME]` for the value of this one request, and refuses the request if the source does not give one |
 
 ### The placeholder swap
 
@@ -299,6 +300,27 @@ before it adds any credential. See [credentials require TLS](decisions.md#a-secr
 [placement keys](../user/egress.md#placement), [the operator selects the credential
 placement](decisions.md#the-operator-selects-the-credential-placement). The gateway looks for the
 placeholder in the same place.
+
+### Request-time sources
+
+A `source://` route keeps the placeholder swap, but the gateway gets the value for each request
+from an endpoint that the operator runs. The order is: the placeholder check, the `http:request`
+decision, the source, then the swap. So the source sees only a request that policy permitted, and
+the value it gives goes only to the placement that `box.toml` sets. The source can refuse a request
+that policy permitted. It can't permit a request that policy denied, as [a credential binding is
+configuration, not a policy action](decisions.md#a-credential-binding-is-configuration-not-a-policy-action) requires.
+
+The gateway sends the request target, the request headers without the placeholder and the framing
+headers, and the body. It removes the header that carries the placeholder first, so the source does
+not see the placeholder where the route expects it. A failure of any kind refuses the request with a
+403, and the request does not go out: the gateway does not try again, and it keeps no value for a
+later request. The response scrub uses the value of that one request.
+
+The box keeps the source out of the workload's reach. A Unix socket's directory is subtracted from
+each workload grant that encloses it, and a grant on that directory is refused. The gateway refuses
+a `CONNECT` from the workload to an `https` source's own host and port.
+[Request-time sources](../user/egress.md#request-time-sources) gives the keys, the wire format, and
+the limits.
 
 ### Signed routes
 

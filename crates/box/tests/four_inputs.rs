@@ -59,6 +59,11 @@
 //! are permitted: policy still judges every `net:connect` and `http:request`. The file is read as an
 //! authority source, so the workload cannot replace it, and the stored record keeps its path.
 //!
+//! `[gateway.credential_source.<name>]` names an endpoint that gives the credential of each request
+//! on a `source://<name>` route. The gateway asks it only after policy permits the request, and it
+//! can only give a value for the route's own placement or refuse, so it grants no reach a permit
+//! does not. Its `ca_file` is read as an authority source.
+//!
 //! `mcp` declares which local MCP servers exist, with a program and its argv. The configuration
 //! selects which servers can start, and `shell:spawn` decides each start. `mcp:call` decides each
 //! request on the stream the server answers. An entry selects and identifies; it grants no request on its own.

@@ -183,6 +183,27 @@ pub(crate) fn open_governed_upstream(
             reason,
         )));
     }
+    // A credential source answers the box, never the workload: a workload request to a source's own
+    // authority is refused whatever the policy permits, so the workload cannot ask the source for a
+    // credential, or reach it at all, through the gateway. This is a deny-only floor, not an
+    // authorization.
+    if state.is_credential_source(&connect.host, connect.port) {
+        let reason = format!(
+            "{}:{} is a credential source of this box; a workload request never reaches it",
+            connect.host, connect.port
+        );
+        emit_connect_decision(
+            state,
+            connect,
+            AuditDecision::Deny,
+            &reason,
+            correlation.clone(),
+        );
+        return Err(OpenUpstreamError::Denied(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            reason,
+        )));
+    }
     let (resolve_host, resolve_port) = match &backend {
         Some(dial) => (dial.host.as_str(), dial.port),
         None => (connect.host.as_str(), connect.port),
@@ -554,6 +575,7 @@ mod tests {
             emitter: Box::new(StubEmitter::new()),
             effect_interceptor: policy,
             reply_copies: Arc::new(super::super::body::CopyBudget::for_limit(1024)),
+            credential_sources: Vec::new(),
         }
     }
 
@@ -801,6 +823,7 @@ mod tests {
             emitter: Box::new(StubEmitter::new()),
             effect_interceptor: policy,
             reply_copies: Arc::new(super::super::body::CopyBudget::for_limit(1024)),
+            credential_sources: Vec::new(),
         }
     }
 

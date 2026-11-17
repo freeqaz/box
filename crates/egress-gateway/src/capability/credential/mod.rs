@@ -10,6 +10,10 @@ use crate::boundary::{InterceptedRequest, InterceptedResponse, Mutation, Target}
 #[cfg(feature = "tls-intercept")]
 use {super::ResponseControls, crate::boundary::HeaderMap};
 
+/// The mutations for one request, the vault's advisory reason, and the request-time source the
+/// vault named, if any.
+type Edits = (Vec<Mutation>, Option<String>, Option<String>);
+
 /// The `accept-encoding` every credentialed request carries.
 const IDENTITY_ENCODING: &str = "identity";
 
@@ -53,13 +57,56 @@ impl CredentialCapability {
             body: &req.body,
         };
         // `headers` wipes its value copies on drop (`SigningHeaders`); it outlives this `Outbound`.
-        let (mutations, advisory) = self.edits_for(outbound)?;
+        let (mutations, advisory, source) = self.edits_for(outbound)?;
         // An advisory injection (secret attached without a matching placeholder) is a noteworthy
         // allow. Set only when present, so a second matching control's normal swap cannot clobber it.
         if let Some(reason) = advisory {
             req.advisory_note = Some(reason);
         }
+        // A request-time route attaches nothing yet: it names the source the driver asks once policy
+        // has permitted the request. Two sources for one request is two credential authorities.
+        if let Some(source) = source {
+            if req
+                .credential_source
+                .as_ref()
+                .is_some_and(|named| *named != source)
+            {
+                return Err(format!(
+                    "two request-time credential sources govern {}; a destination is one \
+                     credential authority",
+                    req.target.host
+                ));
+            }
+            req.credential_source = Some(source);
+        }
         Ok(mutations)
+    }
+
+    /// The edits that attach `value`, the credential a request-time source released for one request
+    /// to `target`, and the scrubber for that exchange's response. `None` when this capability's
+    /// vault governs no request-time credential there.
+    pub(super) fn released_edits(
+        &self,
+        target: &Target,
+        value: Zeroizing<String>,
+    ) -> Option<std::result::Result<(Vec<Mutation>, credentials::ResponseRedactor), String>> {
+        if !self.pattern.matches(&target.as_destination()) {
+            return None;
+        }
+        match self.store.attach_released(target.as_destination(), value) {
+            Ok(None) => None,
+            Ok(Some((attachment, redactor))) => {
+                let mutations = attachment
+                    .set_headers()
+                    .map(|(name, value)| Mutation::SetHeader {
+                        name: name.to_string(),
+                        value: value.clone(),
+                    })
+                    .collect();
+                Some(Ok((mutations, redactor)))
+            }
+            Err(error) => Some(Err(error.to_string())),
+        }
     }
 
     /// The SigV4 edits for a re-routed request whose `Host` the gateway has already rewritten to the
@@ -73,16 +120,15 @@ impl CredentialCapability {
     }
 
     /// Turn the vault's `attach_for` result for `outbound` into mutations, plus the advisory reason
-    /// when the vault set one. Shared by the request leg and the post-rewrite backend signature.
-    fn edits_for(
-        &self,
-        outbound: Outbound<'_>,
-    ) -> std::result::Result<(Vec<Mutation>, Option<String>), String> {
+    /// and the request-time source when the vault named them. Shared by the request leg and the
+    /// post-rewrite backend signature.
+    fn edits_for(&self, outbound: Outbound<'_>) -> std::result::Result<Edits, String> {
         match self.store.attach_for(outbound) {
             // The vault governs no credential for this destination.
-            Ok(None) => Ok((Vec::new(), None)),
+            Ok(None) => Ok((Vec::new(), None, None)),
             Ok(Some(attachment)) => {
                 let advisory = attachment.advisory_reason().map(str::to_string);
+                let source = attachment.credential_source().map(str::to_string);
                 let mut mutations = Vec::new();
                 // Strips first: the phantom must be gone before the real secret is set, and for a
                 // signed route every inbound signing artifact must be gone before the signature lands.
@@ -120,7 +166,7 @@ impl CredentialCapability {
                     name: "accept-encoding".to_string(),
                     value: Zeroizing::new(IDENTITY_ENCODING.to_string()),
                 });
-                Ok((mutations, advisory))
+                Ok((mutations, advisory, source))
             }
             // An ambiguous binding, a missing or mismatched phantom, an underivable signing scope, or a
             // signer error. Every one of them means the request must not go out carrying this
@@ -358,6 +404,7 @@ pub(super) mod tests {
             headers,
             body: Vec::new(),
             advisory_note: None,
+            credential_source: None,
         }
     }
 

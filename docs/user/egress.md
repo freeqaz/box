@@ -63,14 +63,15 @@ when { context.input.host == "api.github.com" };
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `destinations` | string array | required | The destinations the credential goes to. See [Destinations](#destinations). |
-| `secret.ref` | string | required, unless the entry declares a backend | Where the credential comes from: `env://NAME`, `aws://PROFILE`, or a bare `aws://` for the default credential chain. See [Credential sources](#credential-sources). |
+| `secret.ref` | string | required, unless the entry declares a backend | Where the credential comes from: `env://NAME`, `aws://PROFILE`, a bare `aws://` for the default credential chain, or `source://NAME` for a [request-time source](#request-time-sources). See [Credential sources](#credential-sources). |
+| `secret.env` | string | required for `source://` | For `source://` only: the variable the placeholder goes in. |
 | `backends` | table array | none | A destination to re-route this entry's requests to. At most one. See [Backends](#backends). |
-| `secret.placement` | string | `header` | For `env://`: where the credential goes. `header`, `basic_auth`, or `query_param`. |
-| `secret.header` | string | `Authorization` | For `env://` with `placement = "header"`: the header name. |
-| `secret.prefix` | string | `Bearer ` on `Authorization`, empty on any other header | For `env://` with `placement = "header"`: the text before the credential. |
+| `secret.placement` | string | `header` | For `env://` and `source://`: where the credential goes. `header`, `basic_auth`, or `query_param`. A `source://` route refuses `query_param`. |
+| `secret.header` | string | `Authorization` | For `env://` and `source://` with `placement = "header"`: the header name. |
+| `secret.prefix` | string | `Bearer ` on `Authorization`, empty on any other header | For `env://` and `source://` with `placement = "header"`: the text before the credential. |
 | `secret.param` | string | none | For `env://` with `placement = "query_param"`: the query parameter name. Required for that placement. |
-| `secret.inject` | string | `phantom` | For `env://`: `phantom` adds the credential only to a request that carries the placeholder, and refuses any other request to the destinations. `always` adds it to every request to the destinations. Refused beside a backend, where the destination secret is phantom-only and the box injects nothing. |
-| `secret.phantom_prefix` | string | `strands_box_` | For `env://`: the start of the placeholder, such as `sk-ant-` for a client that checks the key's format. 1 to 64 letters, digits, `-`, `_`, `.`, or `~`. |
+| `secret.inject` | string | `phantom` | For `env://` and `source://`: `phantom` adds the credential only to a request that carries the placeholder, and refuses any other request to the destinations. `always` adds it to every request to the destinations. Refused beside a backend, where the destination secret is phantom-only and the box injects nothing. |
+| `secret.phantom_prefix` | string | `strands_box_` | For `env://` and `source://`: the start of the placeholder, such as `sk-ant-` for a client that checks the key's format. 1 to 64 letters, digits, `-`, `_`, `.`, or `~`. |
 
 ### Placement
 
@@ -189,6 +190,7 @@ A remote MCP server re-routes the same way: attach `[[mcp.<name>.backends]]` to 
 | `env://NAME` | The variable `NAME` in the environment of `box run` | Once, when the box starts. The agent, each tool, each stdio MCP server, and the Shell get a placeholder in `NAME`. Every destination that names `NAME`, in one route or in several, accepts the same placeholder. |
 | `aws://PROFILE` | The named profile `PROFILE`, resolved through the AWS SDK | On each request. The gateway signs the request with SigV4. |
 | `aws://` (no profile) | The AWS SDK default credential provider chain on the host | On each request. The gateway signs the request with SigV4, under the host's ambient identity. |
+| `source://NAME` | The endpoint of `[gateway.credential_source.NAME]` | On each request, after policy permits it. See [Request-time sources](#request-time-sources). The agent gets a placeholder in `secret.env`. |
 
 An `aws://` route takes no placement, `header`, `prefix`, `param`, `inject`, or
 `phantom_prefix`. The gateway signs each request to the destinations. The service and region come
@@ -233,6 +235,122 @@ deployment that must pin the identity writes `aws://PROFILE` rather than a bare 
 
 The gateway adds a credential only over HTTPS. A plain `http://` request to a destination a route
 names is refused.
+
+## Request-time sources
+
+A request-time source is an endpoint that you operate. It gives the credential for one request.
+Use it when the credential depends on the request, for example a token that has a scope for one
+repository, or when a service outside the box must make a record of each use.
+
+```toml
+[gateway.credential_source.github]
+endpoint = "unix:///run/credential-source/source.sock"
+bearer   = "env://SOURCE_TOKEN"
+
+[egress.github]
+destinations = ["api.github.com"]
+secret.ref   = "source://github"
+secret.env   = "GITHUB_TOKEN"
+secret.prefix = "token "
+```
+
+The agent gets a placeholder in `GITHUB_TOKEN`, as for `env://`. For each request to
+`api.github.com`, the gateway does these steps in this order:
+
+1. It checks the placeholder, as `secret.inject` sets.
+2. Policy decides `http:request`. A request that policy denies does not go to the source.
+3. The gateway sends the request to the source: the target, the headers, and the body. It removes
+   the header that carries the placeholder first.
+4. The source sends one value, or a refusal.
+5. The gateway puts the value where `secret.placement`, `secret.header`, and `secret.prefix` set,
+   and sends the request to the destination.
+6. On the response, the gateway replaces each copy of the value with `[REDACTED]`.
+
+The source gives a value or a refusal. It can't permit a request that policy denies, and it can't
+change where the value goes. The gateway asks the source again for each request. It keeps no value
+after the request, and it does not try again after a failure.
+
+The gateway refuses the request with a 403 and `x-strands-box-egress: refused` when the source
+refuses, does not reply before `timeout_ms`, sends a reply that is not valid, or sends a value that
+is empty or that holds a control character. The body of the 403 is
+`credential refused by its source: <code>` for a refusal, or `credential source unavailable` for
+all other failures. The request does not go to the destination.
+
+### `[gateway.credential_source.<name>]`
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `endpoint` | string | required | `unix:///absolute/path` for a Unix socket, or `https://host[:port][/path]`. |
+| `ca_file` | path | the public roots | For `https`: a PEM file of the CA certificates that sign the endpoint's certificate. The gateway uses only these, not the public roots. Relative to `box.toml`. |
+| `bearer` | string | none | `env://NAME`. The gateway sends `Authorization: Bearer <value of NAME>` to the source. `box run` reads `NAME` when it starts, and an unset or empty variable stops the run. |
+| `timeout_ms` | integer | `5000` | How long the gateway waits for the reply, from 1 to 60000. |
+| `max_body_bytes` | integer | `1048576` | The largest request body the gateway sends to the source, up to 16 MiB. The gateway refuses a request with a larger body. It does not cut the body. |
+
+A name holds only letters, digits, `.`, `_`, and `-`. A `source://` route that names a source that
+is not declared is refused when the config loads.
+
+### What the source receives
+
+The gateway sends `POST` to the endpoint, with `content-type: application/json`:
+
+```json
+{
+  "version": 1,
+  "request_id": "9f0c4b1e6d2a47c3b8e5f1a0d3c6b9e2",
+  "target": {
+    "scheme": "https", "host": "api.github.com", "port": 443,
+    "method": "POST", "path": "/repos/o/r/pulls", "query": "state=open"
+  },
+  "headers": [["accept", "application/vnd.github+json"], ["content-type", "application/json"]],
+  "body": "eyJ0aXRsZSI6InQifQ=="
+}
+```
+
+- `request_id` is 32 random hex characters, new for each request.
+- `path` has no query. `query` is the text after `?`, or `""` when the request has no query.
+- `headers` are in the order the workload sent them, with lowercase names. The gateway removes the
+  placeholder's header, `host`, `content-length`, `transfer-encoding`, `connection`, the other
+  hop-by-hop headers, `proxy-authorization`, and each header that `connection` names.
+- `body` is the request body in standard base64.
+
+### What the source sends back
+
+A `200` response with a JSON body of at most 64 KiB. To give a value:
+
+```json
+{"version": 1, "request_id": "9f0c4b1e6d2a47c3b8e5f1a0d3c6b9e2",
+ "credential": "ghs_…", "send_by_unix_ms": 1795000000000}
+```
+
+To refuse:
+
+```json
+{"version": 1, "request_id": "9f0c4b1e6d2a47c3b8e5f1a0d3c6b9e2", "refusal": "installation_suspended"}
+```
+
+- `request_id` must be the one the gateway sent.
+- The reply holds `credential` or `refusal`, not both.
+- `send_by_unix_ms` is required with `credential`. The gateway refuses the request if the time is
+  in the past when the value arrives, or when the gateway is about to send the request.
+- A `refusal` code of 1 to 64 letters, digits, `.`, `_`, or `-` goes to the workload. The gateway
+  shows any other code as `invalid`.
+- The gateway ignores fields that it does not know.
+
+### Limits
+
+- **Keep the source away from the workload.** For a Unix socket, the box keeps the socket's
+  directory out of each workload grant. A grant that is that directory, or a directory in it, is
+  refused when the config loads. For an `https` endpoint, the gateway refuses a `CONNECT` from the
+  workload to the endpoint's host and port. It compares names, not addresses, so do not let the
+  workload reach the endpoint through a different name.
+- A `source://` route can't go beside a backend, and a remote MCP server can't use one.
+- The gateway does not wipe all copies of the value from memory. Its HTTP client keeps the reply
+  bytes and the header value in buffers that it frees without wiping. The bearer token has the same
+  limit.
+- The gateway compares `send_by_unix_ms` with the host clock. Allow for clock skew between the host
+  and the source.
+- A request that takes a long time to send can arrive after `send_by_unix_ms`. The gateway checks
+  the time before it opens the upstream connection, not when the last byte goes.
 
 ## Upgrade plain HTTP to HTTPS
 

@@ -11,9 +11,10 @@ use crate::sources::{
     AwsAcquisition, AwsResolution, AwsSource, CREDSD_SCHEME, CredsdClient,
     credsd_session_credentials,
 };
-use crate::vault::{BoxOwnedBinding, OpaqueBinding, StripBinding};
+use crate::vault::{BoxOwnedBinding, OpaqueBinding, RequestTimeBinding, StripBinding};
 use crate::{
-    CredentialError, InjectMode, Locator, PhantomCheck, RequestId, Result, Vault, sign_request,
+    CredentialError, InjectMode, Locator, PhantomCheck, RequestId, Result, Secret, Vault,
+    sign_request,
 };
 
 /// The header the `Header` / `BasicAuth` inject modes use when the mode carries no explicit name.
@@ -40,13 +41,69 @@ impl Vault {
         binding: &OpaqueBinding,
         req: &Outbound<'_>,
     ) -> Result<Attachment> {
+        let advisory = self.check_phantom(
+            req,
+            binding.harness(),
+            binding.phantom(),
+            binding.phantom_check(),
+        )?;
+        let mut attachment = Attachment::new();
+        attach_secret(binding.inject(), binding.secret(), &mut attachment);
+        if let Some(against) = advisory {
+            // Journalled on the gateway's allow decision (with the destination and requester
+            // correlation the vault does not hold), so an advisory injection is reconstructable.
+            attachment.note_advisory(format!("inject = always, against {against}"));
+        }
+
+        // The harness may have placed the phantom at a *different* location than the one the secret
+        // attaches to. `attach_secret` clears the attach location; when the harness location differs,
+        // clear that one too so the phantom never rides upstream.
+        strip_location(binding.harness(), &mut attachment)?;
+
+        Ok(attachment)
+    }
+
+    /// Check the phantom on `req` per the binding's mode, then strip it and the attach location and
+    /// name the binding's source. Nothing is attached: the caller asks the source for this request's
+    /// credential and attaches it with [`Vault::attach_released`].
+    pub(crate) fn defer_to_source(
+        &self,
+        binding: &RequestTimeBinding,
+        req: &Outbound<'_>,
+    ) -> Result<Attachment> {
+        let advisory = self.check_phantom(
+            req,
+            binding.harness(),
+            binding.phantom(),
+            binding.phantom_check(),
+        )?;
+        let mut attachment = Attachment::new();
+        if let Some(against) = advisory {
+            attachment.note_advisory(format!("inject = always, against {against}"));
+        }
+        // Neither the placeholder nor anything else the workload put where the credential goes
+        // reaches the source or the upstream.
+        strip_location(binding.inject(), &mut attachment)?;
+        strip_location(binding.harness(), &mut attachment)?;
+        attachment.defer_to_source(binding.source());
+        Ok(attachment)
+    }
+
+    /// Whether the phantom the harness placed at `harness` on `req` is `phantom`, per `check`. A
+    /// `Strict` check refuses an absent or mismatched placeholder; an `Advisory` check warns and
+    /// returns the non-secret reason to journal.
+    fn check_phantom(
+        &self,
+        req: &Outbound<'_>,
+        harness: &InjectMode,
+        phantom: &str,
+        check: PhantomCheck,
+    ) -> Result<Option<&'static str>> {
         // Read the phantom the harness placed, wherever it placed it. A `Strict` route fails closed
         // on an absent or mismatched placeholder; an `Advisory` route warns and attaches anyway,
         // for a workload the box cannot seed the placeholder into.
-        let observed = observe_phantom(req, binding.harness());
-        let matches = observed
-            .as_deref()
-            .is_some_and(|token| token == binding.phantom());
+        let observed = observe_phantom(req, harness);
+        let matches = observed.as_deref().is_some_and(|token| token == phantom);
 
         // `Some` only for an advisory override, carrying the non-secret reason to journal.
         let mut advisory: Option<&'static str> = None;
@@ -56,7 +113,7 @@ impl Vault {
             } else {
                 "an unrecognised placeholder token"
             };
-            match binding.phantom_check() {
+            match check {
                 PhantomCheck::Strict if observed.is_none() => {
                     return Err(CredentialError::UnsupportedInjectType(
                         "no phantom token found at the harness credential location; refusing to \
@@ -81,21 +138,7 @@ impl Vault {
                 }
             }
         }
-
-        let mut attachment = Attachment::new();
-        attach_secret(binding.inject(), binding.secret(), &mut attachment);
-        if let Some(against) = advisory {
-            // Journalled on the gateway's allow decision (with the destination and requester
-            // correlation the vault does not hold), so an advisory injection is reconstructable.
-            attachment.note_advisory(format!("inject = always, against {against}"));
-        }
-
-        // The harness may have placed the phantom at a *different* location than the one the secret
-        // attaches to. `attach_secret` clears the attach location; when the harness location differs,
-        // clear that one too so the phantom never rides upstream.
-        strip_location(binding.harness(), &mut attachment)?;
-
-        Ok(attachment)
+        Ok(advisory)
     }
 
     /// SigV4-sign `req` in-boundary against the AWS `config` bound to its destination. `scope` is the
@@ -260,6 +303,14 @@ pub(crate) fn attach_box_owned(binding: &BoxOwnedBinding, attachment: &mut Attac
 /// `attachment` so it can compose with a box-owned attach in one `attach_for`.
 pub(crate) fn strip_phantom(binding: &StripBinding, attachment: &mut Attachment) -> Result<()> {
     strip_location(binding.harness(), attachment)
+}
+
+/// Attach `secret`, the value a request-time source released for one request, at the binding's
+/// inject location; `defer_to_source` already stripped the placeholder from the request.
+pub(crate) fn attach_released(binding: &RequestTimeBinding, secret: &Secret) -> Attachment {
+    let mut attachment = Attachment::new();
+    attach_secret(binding.inject(), secret.as_str(), &mut attachment);
+    attachment
 }
 
 /// Strip the placeholder at `location` from `attachment`, so it does not ride upstream. Shared by

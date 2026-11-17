@@ -87,6 +87,32 @@ pub fn upstream_ca_certificates(pem: &str) -> std::result::Result<Vec<Vec<u8>>, 
     Ok(certificates)
 }
 
+/// Build the client [`ClientConfig`] a credential source's `https` endpoint is verified with: only
+/// the certificates in `ca_pems` when there are any, else the public roots. The gateway's additive
+/// upstream bundle is never consulted, so a root trusted for upstreams vouches for no source.
+pub(super) fn source_client_config(ca_pems: &[String]) -> Result<ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    if ca_pems.is_empty() {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+    for pem in ca_pems {
+        let certs = parse_pem_certs(pem)?;
+        if certs.is_empty() {
+            return Err(ProxyError::Config(
+                "the credential source CA file holds no certificate".to_string(),
+            ));
+        }
+        for cert in certs {
+            roots
+                .add(cert)
+                .map_err(|e| ProxyError::Config(format!("adding the source CA: {e}")))?;
+        }
+    }
+    Ok(ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
+
 /// Parse PEM-encoded certificates into DER, for the additive trust bundle.
 fn parse_pem_certs(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
     CertificateDer::pem_slice_iter(pem.as_bytes())

@@ -20,4 +20,4 @@ pub(crate) use material::AwsSessionCredentials;
 pub(crate) use secret::Secret;
 // The route's private kind enum, for the store's dispatch. Re-exported crate-internally rather than
 // making the module public, so the variant set stays the crate's.
-pub(crate) use route::RouteKind;
+pub(crate) use route::{REQUEST_TIME_SCHEME, RouteKind};

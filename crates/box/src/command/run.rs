@@ -34,6 +34,7 @@ struct LockedRun {
     grammars: ToolGrammars,
     sources: Vec<AuthoritySource>,
     upstream_ca_pems: Vec<String>,
+    credential_source_pems: std::collections::BTreeMap<String, String>,
     owned: Lock,
 }
 
@@ -250,6 +251,12 @@ async fn hosted(
         std::io::stderr().lock(),
     )
     .map_err(|source| ConfigError::Disclosure { source })?;
+    // Each source's bearer token is read from the operator's environment here, so an unset token
+    // stops the run before the workload is announced.
+    let credential_sources = crate::run::credential::credential_sources(
+        &locked.record.gateway,
+        &locked.credential_source_pems,
+    )?;
     eprintln!("strands-box: starting workload");
     let hosted = HostedBox::open(
         &locked.root,
@@ -259,6 +266,7 @@ async fn hosted(
         collector,
         &locked.sources,
         &locked.upstream_ca_pems,
+        credential_sources,
         locked.owned,
         &locked.workspace,
         &home,
@@ -384,6 +392,7 @@ fn prepare(config: &Path, argv: &[OsString], box_id: Option<&str>) -> Result<Loc
         grammars: request.grammars,
         sources: request.sources,
         upstream_ca_pems: request.upstream_ca_pem.into_iter().collect(),
+        credential_source_pems: request.credential_source_pems,
         owned,
     })
 }

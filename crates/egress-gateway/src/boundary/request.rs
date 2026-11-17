@@ -166,6 +166,9 @@ pub struct InterceptedRequest {
     /// A non-secret note a capability attaches for the driver to journal on the allow decision, never
     /// applied to the wire.
     pub advisory_note: Option<String>,
+    /// The request-time credential source a capability named for this request. The request carries
+    /// no credential until the driver asks that source, after policy has permitted the request.
+    pub credential_source: Option<String>,
 }
 
 impl std::fmt::Debug for InterceptedRequest {
@@ -225,6 +228,7 @@ mod tests {
             headers,
             body: b"{\"prompt\":\"secret user content\"}".to_vec(),
             advisory_note: None,
+            credential_source: None,
         };
         let rendered = format!("{req:?}");
         assert!(

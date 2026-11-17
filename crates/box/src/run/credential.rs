@@ -56,6 +56,48 @@ const SIGNING_PLACEHOLDERS: [(&str, &str); 2] = [
     ),
 ];
 
+/// The gateway's view of each `[gateway.credential_source.<name>]`: its endpoint, the CA text read
+/// when the configuration loaded, and its bearer token, read now from the operator's environment.
+///
+/// A token that is unset, empty, or not text stops the run before the workload starts, as an
+/// unresolved `env://` secret does.
+pub(crate) fn credential_sources(
+    gateway: &crate::record::config::gateway::Gateway,
+    pems: &BTreeMap<String, String>,
+) -> Result<Vec<egress_gateway::CredentialSource>, BoxError> {
+    let mut sources = Vec::with_capacity(gateway.credential_source.len());
+    for (name, declared) in &gateway.credential_source {
+        let refuse = |reason: String| -> BoxError {
+            Internal::CredentialProjection(format!("credential source {name}: {reason}")).into()
+        };
+        let mut source = egress_gateway::CredentialSource::new(name.as_str(), &declared.endpoint)
+            .map_err(|error| refuse(error.to_string()))?;
+        if let Some(pem) = pems.get(name) {
+            source = source.trusting(pem.clone());
+        }
+        if let Some(variable) = declared.bearer_variable() {
+            let token = std::env::var(variable)
+                .ok()
+                .filter(|token| !token.trim().is_empty())
+                .ok_or_else(|| {
+                    refuse(format!(
+                        "its bearer variable {variable} is unset, empty, or not text"
+                    ))
+                })?;
+            source = source.bearer(token);
+        }
+        if let Some(timeout) = declared.timeout_ms {
+            source = source.timeout(std::time::Duration::from_millis(timeout));
+        }
+        if let Some(bytes) = declared.max_body_bytes {
+            source = source.max_body_bytes(usize::try_from(bytes).unwrap_or(usize::MAX));
+        }
+        source.check().map_err(|error| refuse(error.to_string()))?;
+        sources.push(source);
+    }
+    Ok(sources)
+}
+
 /// The bindings that share one vault: every binding provisioned under one variable, or one binding
 /// that provisions none.
 fn credential_groups(bindings: &[EgressRoute]) -> Vec<Vec<&EgressRoute>> {

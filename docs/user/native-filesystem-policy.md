@@ -108,14 +108,15 @@ A box ID that a library caller supplied, other than `box-` and 16 hexadecimal di
 version 34.
 Enabling [`file-watching`](config.md#file-watching) for any process requires record version 35.
 Setting [`[gateway] upstream_ca_file`](config.md#trust-a-private-ca-for-upstream-servers) requires record version 36.
+A [`[gateway.credential_source.<name>]`](egress.md#request-time-sources) requires record version 37.
 When a configuration selects more than one of these features, it uses the highest required version
 and retains every selection. Older binaries refuse unsupported versions.
 
 To disable the experiment, change the global setting to `false`.
 Remove all process overrides and `[limits]` settings, give each stdio MCP server its own
 program, set `file-attributes` to `false`, remove `file-watching` from every process,
-remove `[gateway] upgrade_http`, and remove `[gateway] upstream_ca_file` before returning to
-a binary that supports only version 21.
+remove `[gateway] upgrade_http`, remove `[gateway] upstream_ca_file`, and remove each
+`[gateway.credential_source.<name>]` before returning to a binary that supports only version 21.
 If MCP argument wildcards are enabled, replace the stars with concrete arguments and disable
 `argument_wildcards` on each server too.
 Replace each absolute MCP executable path with a bare program name that the server's `PATH`

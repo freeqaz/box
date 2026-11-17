@@ -27,6 +27,7 @@ tls-intercept = [
     "dep:hyper",
     "dep:hyper-util",
     "dep:http-body-util",
+    "dep:base64",
 ]
 
 [dependencies]
@@ -73,6 +74,9 @@ tokio-rustls = { version = "0.26", optional = true, default-features = false, fe
 hyper = { version = "1", optional = true, features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", optional = true, features = ["tokio"] }
 http-body-util = { version = "0.1", optional = true }
+# The request body a request-time credential source receives, as base64 inside its JSON document. The
+# same version and features `strands-box-credentials` already uses, so the lockfile gains no crate.
+base64 = { version = "0.23", optional = true, default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # The full-interception E2E stands up a real TLS upstream and a real TLS workload client (both
