@@ -418,6 +418,19 @@ pub(crate) const WORKLOAD_PERMITTED: &[PermittedSyscall] = &[
         name: "tgkill",
         number: libc::SYS_tgkill,
     },
+    // An init that runs the workload's command as its child, such as tini, waits for signals with
+    // `rt_sigtimedwait` and forwards each one with `kill`. Without them it exits at start with
+    // "Unexpected error in sigtimedwait: Operation not permitted". The PID namespace bounds `kill`
+    // as it bounds `tgkill`: its process-group and broadcast forms reach only processes the
+    // workload can see.
+    PermittedSyscall {
+        name: "kill",
+        number: libc::SYS_kill,
+    },
+    PermittedSyscall {
+        name: "rt_sigtimedwait",
+        number: libc::SYS_rt_sigtimedwait,
+    },
     PermittedSyscall {
         name: "setsid",
         number: libc::SYS_setsid,
@@ -944,17 +957,38 @@ pub(crate) struct SyscallFilters {
 
 /// The static system-call policy for one containment request.
 #[derive(Debug)]
-pub(crate) struct SyscallPolicy;
+pub(crate) struct SyscallPolicy {
+    #[cfg(all(feature = "native-filesystem-policy", box_native_adapter_tests))]
+    native_filesystem: bool,
+}
 
 impl SyscallPolicy {
     /// Derive the policy from one request.
     pub(crate) fn for_config(_network: &Network) -> Self {
-        Self
+        Self {
+            #[cfg(all(feature = "native-filesystem-policy", box_native_adapter_tests))]
+            native_filesystem: false,
+        }
+    }
+
+    #[cfg(all(feature = "native-filesystem-policy", box_native_adapter_tests))]
+    pub(crate) fn with_native_filesystem(mut self, enabled: bool) -> Self {
+        self.native_filesystem = enabled;
+        self
     }
 
     /// Compile both filters before containment starts.
     pub(crate) fn compile(&self) -> Result<SyscallFilters, ContainmentError> {
         let permit_rules = build_permit_rules(WORKLOAD_PERMITTED, true)?;
+        #[cfg(all(feature = "native-filesystem-policy", box_native_adapter_tests))]
+        let permit_rules = {
+            let mut rules = permit_rules;
+            if self.native_filesystem {
+                // The notification filter must mediate this path-based call before it can run.
+                rules.insert(libc::SYS_truncate, Vec::new());
+            }
+            rules
+        };
         let permit = compile_filter(
             permit_rules,
             SeccompAction::Errno(libc::EPERM as u32),
@@ -979,8 +1013,19 @@ impl SyscallPolicy {
             SeccompAction::Errno(libc::EPERM as u32),
         )?;
 
+        let notification_rules = BTreeMap::from([(libc::SYS_statfs, Vec::new())]);
+        #[cfg(all(feature = "native-filesystem-policy", box_native_adapter_tests))]
+        let notification_rules = {
+            let mut rules = notification_rules;
+            if self.native_filesystem {
+                for number in super::native_filesystem::OPERATIONS {
+                    rules.insert(*number, Vec::new());
+                }
+            }
+            rules
+        };
         let mut filesystem_queries = compile_filter(
-            BTreeMap::from([(libc::SYS_statfs, Vec::new())]),
+            notification_rules,
             SeccompAction::Allow,
             SeccompAction::Trace(0),
         )?;
@@ -1415,10 +1460,10 @@ mod tests {
     #[test]
     fn permit_filter_has_the_expected_workload_and_installer_entries() {
         let x86_entries = usize::from(cfg!(target_arch = "x86_64"));
-        assert_eq!(WORKLOAD_PERMITTED.len(), 117 + 18 * x86_entries);
+        assert_eq!(WORKLOAD_PERMITTED.len(), 119 + 18 * x86_entries);
         let rules =
             build_permit_rules(WORKLOAD_PERMITTED, true).expect("the permit table must be unique");
-        assert_eq!(rules.len(), 120 + 19 * x86_entries);
+        assert_eq!(rules.len(), 122 + 19 * x86_entries);
         assert!(rules.contains_key(&libc::SYS_seccomp));
         assert_eq!(rules[&libc::SYS_setresuid].len(), 1);
         assert_eq!(rules[&libc::SYS_setresgid].len(), 1);
@@ -1697,6 +1742,39 @@ mod tests {
                     .any(|entry| entry.name == name && entry.number == number),
                 "'{name}' is absent from the permit table, so a Go program gets EPERM when it \
                  waits for a child and gh cannot run git"
+            );
+            assert!(!MEDIATED.iter().any(|entry| entry.name == name));
+            let number = u32::try_from(number).expect("syscall numbers are small");
+            assert!(
+                filters
+                    .permit
+                    .iter()
+                    .any(|instruction| instruction.k == number)
+            );
+            assert!(
+                !filters
+                    .restrictions
+                    .iter()
+                    .any(|instruction| instruction.k == number)
+            );
+        }
+    }
+
+    #[test]
+    fn signal_waits_and_process_signals_are_permitted_and_unmediated() {
+        let filters = SyscallPolicy::for_config(&Network::Blocked)
+            .compile()
+            .expect("filters compile");
+        for (name, number) in [
+            ("kill", libc::SYS_kill),
+            ("rt_sigtimedwait", libc::SYS_rt_sigtimedwait),
+        ] {
+            assert!(
+                WORKLOAD_PERMITTED
+                    .iter()
+                    .any(|entry| entry.name == name && entry.number == number),
+                "'{name}' is absent from the permit table, so an init such as tini gets EPERM \
+                 when it waits for or forwards a signal, and the workload exits at start"
             );
             assert!(!MEDIATED.iter().any(|entry| entry.name == name));
             let number = u32::try_from(number).expect("syscall numbers are small");
