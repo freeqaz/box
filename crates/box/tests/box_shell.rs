@@ -2625,8 +2625,8 @@ fn a_leaf_box_cannot_write_the_projects_own_authority() {
     std::fs::create_dir_all(&authority).expect("the project's own authority directory");
     let policy = authority.join("policy.dw");
     let policy_before = std::fs::read_to_string(&policy).expect("the loaded policy");
-    // A seed the host binary copies FROM, because a leaf host binary receives no piped stdin —
-    // measured: `echo x | dd` reports `0+0 records in` inside a leaf.
+    // A seed the host binary copies FROM, so the subject does not depend on the leaf's stdin
+    // (`a_leaf_host_binary_reads_what_the_command_was_piped` covers that).
     std::fs::write(box_.workspace().join("seed.txt"), "LEAF_WROTE_THIS\n").expect("a seed to copy");
 
     // The control: the same host binary writes an ordinary file in the project, which must land.
@@ -2645,6 +2645,70 @@ fn a_leaf_box_cannot_write_the_projects_own_authority() {
         after == policy_before,
         "a leaf box must not write the policy that governs the next run of this box: \
          {attempt:?}\nthe policy now reads: {after}"
+    );
+}
+
+/// Run `dd` as a leaf with the given Shell command, then read back what it wrote and the status.
+fn leaf_stdin_case(label: &str, script: &str, written: &str) -> (String, Output) {
+    let box_ = Request::with_config(label, ONE_WRITER_POLICY, DD_TOOL).expect();
+    let output = box_.bash(&format!(r#"{script}; printf "|status=%s" "$?""#));
+    let landed = std::fs::read_to_string(box_.workspace().join(written)).unwrap_or_default();
+    (landed, output)
+}
+
+/// **A leaf host binary reads the input piped to the alias.** A harness hook gets its event on
+/// the alias's stdin; the leaf that runs the hook program reads it as a pipe.
+#[test]
+fn a_leaf_host_binary_reads_what_the_command_was_piped() {
+    if !fixture::namespace_launcher_is_usable() {
+        println!("skipping: this platform has no usable containment backend");
+        return;
+    }
+    let (landed, output) = leaf_stdin_case(
+        "leaf-stdin",
+        r#"printf 'PIPED_TO_LEAF\n' | zsh -lc "dd of={workspace}/piped.txt""#,
+        "piped.txt",
+    );
+    assert_eq!(
+        landed, "PIPED_TO_LEAF\n",
+        "the leaf must read exactly what the command was piped: {output:?}"
+    );
+    assert!(stdout(&output).contains("|status=0"), "{output:?}");
+}
+
+/// **A leaf host binary reads a pipe inside one Shell command.**
+#[test]
+fn a_leaf_host_binary_reads_a_pipe_inside_the_command() {
+    if !fixture::namespace_launcher_is_usable() {
+        println!("skipping: this platform has no usable containment backend");
+        return;
+    }
+    let (landed, output) = leaf_stdin_case(
+        "leaf-stdin-inner",
+        r#"zsh -lc "printf 'INNER_PIPE\n' | dd of={workspace}/inner.txt""#,
+        "inner.txt",
+    );
+    assert_eq!(landed, "INNER_PIPE\n", "{output:?}");
+    assert!(stdout(&output).contains("|status=0"), "{output:?}");
+}
+
+/// **A command with no input gives the leaf none, and does not hold it.**
+#[test]
+fn a_leaf_host_binary_with_no_input_reads_nothing_and_finishes() {
+    if !fixture::namespace_launcher_is_usable() {
+        println!("skipping: this platform has no usable containment backend");
+        return;
+    }
+    let (landed, output) = leaf_stdin_case(
+        "leaf-stdin-none",
+        r#"zsh -lc "dd of={workspace}/empty.txt" </dev/null"#,
+        "empty.txt",
+    );
+    assert_eq!(landed, "", "{output:?}");
+    assert!(stdout(&output).contains("|status=0"), "{output:?}");
+    assert!(
+        stderr(&output).contains("0+0 records in"),
+        "the leaf must read an empty input: {output:?}"
     );
 }
 

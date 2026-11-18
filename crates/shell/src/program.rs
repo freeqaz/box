@@ -18,6 +18,9 @@ pub struct HostSpawn {
     pub args: Vec<String>,
     /// The directory the program's decision checked.
     pub cwd: PathBuf,
+    /// The read end of a pipe the Shell fills from the command's stdin while the program runs, or
+    /// `None` for a command with no stdin.
+    pub stdin: Option<tokio::io::DuplexStream>,
 }
 
 /// The captured result of one host-binary spawn.

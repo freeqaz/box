@@ -1781,6 +1781,7 @@ mod tests {
                         LeafBox::run(
                             boundary,
                             &fixture.root,
+                            None,
                             #[cfg(any(
                                 all(target_os = "macos", feature = "native-filesystem-policy"),
                                 all(
@@ -1834,6 +1835,7 @@ mod tests {
                 LeafBox::run(
                     boundary,
                     &fixture.root,
+                    None,
                     #[cfg(any(
                         all(target_os = "macos", feature = "native-filesystem-policy"),
                         all(
@@ -5309,6 +5311,7 @@ write = ["/Users/example/box-demo/aws-tmp"]
                 LeafBox::run(
                     boundary,
                     &fixture.root,
+                    None,
                     #[cfg(any(
                         all(target_os = "macos", feature = "native-filesystem-policy"),
                         all(

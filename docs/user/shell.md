@@ -44,10 +44,13 @@ This limit applies only to input piped into the alias from outside the Shell, su
 event or a program that starts `bash` with input. A pipe inside a command, such as
 `cat big.json | jq .`, is not affected.
 
-Only commands that the Shell runs itself, such as `cat`, `read`, or `jq`, receive the input. A
-program that the Shell starts in its own sandbox gets no input. Text that a command reads from its
-input is still data: when a command runs it, as in `eval "$(cat)"`, or opens a file it names,
-policy decides that command or file.
+A command that the Shell runs itself, such as `cat`, `read`, or `jq`, receives the input. So does
+a program that the Shell starts in its own sandbox: it reads its input as a pipe while it runs, so a
+hook program reads its event the same way through `zsh -c "hook-program"` as through
+`printf '%s' "$event" | hook-program` inside one command. Forwarding stops when the program exits,
+so a program that does not read its input is not held by it. A command with no input gives the
+program none. Text that a command reads from its input is still data: when a command runs it, as
+in `eval "$(cat)"`, or opens a file it names, policy decides that command or file.
 
 A Lua script that the Shell runs does not read the input piped into the alias: it reads it as empty
 and never waits for it. A pipe inside one command, such as `echo x | lua -e 'print(io.read())'`,
@@ -151,7 +154,11 @@ permit (principal, action == Box::Action::"shell:spawn", resource)
 when { context.input.program_path like "~/src/project/target/debug/*" };
 ```
 
-A program's filesystem lists bound its own file operations.
+A program's filesystem lists bound its own file operations. It also reads the command's input, as
+[standard input](#standard-input) states, and a permit does not look at that input. A permitted
+interpreter that reads a program from its input, such as `node` or `perl` with no script
+argument, runs whatever the agent pipes to it in the program's sandbox, so permit one only with the
+arguments it needs.
 
 When an experimental [tool grammar](config.md#toolnamegrammar) binds the program, Box decides the
 spawn as the grammar's action, such as `Tool::git::Action::"push"`, or as `unmodeled` when the

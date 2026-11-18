@@ -634,7 +634,8 @@ sandbox already has both.
 A tool's sandbox has no route back to its own box. Box takes the alias directory off its `PATH`,
 hides the box directory that holds the aliases, and gives it no connect rule for the broker's
 socket. A tool can't ask Box to start another program in a sandbox of its own, or ask Strands Shell
-to act for the agent. What comes back is its output and its exit status. Its network traffic goes
+to act for the agent. What goes in is its arguments and the command's input, which it reads as a
+pipe while it runs. What comes back is its output and its exit status. Its network traffic goes
 through the egress gateway, unless its `[tool.<name>.network]` table sets `contain_egress = false`.
 That gives the tool direct network access with the arguments the agent passes, and removes gateway
 checks, credential injection, and traffic records for it. See [native egress is an operator-declared
